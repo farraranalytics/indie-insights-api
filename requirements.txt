@@ -1,0 +1,22 @@
+# Farrar Analytics Backend Dependencies
+
+# Web framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# Data processing
+pandas==2.2.0
+numpy==1.26.3
+openpyxl==3.1.2  # For Excel file support
+
+# Database
+supabase==2.3.4
+
+# File handling
+python-multipart==0.0.6
+
+# Environment
+python-dotenv==1.0.0
+
+# Type checking
+pydantic==2.5.3
