@@ -3,7 +3,7 @@ Farrar Analytics - Indie Artist Insights API
 Main FastAPI application
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
@@ -29,6 +29,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Database availability flag
+DB_ENABLED = bool(os.getenv("SUPABASE_URL")) and bool(os.getenv("SUPABASE_SERVICE_KEY"))
+
+
+def get_db():
+    """Lazy import database module only when needed"""
+    from . import database
+    return database
+
 
 @app.get("/")
 async def root():
@@ -37,61 +46,90 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "db_enabled": DB_ENABLED}
 
 
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    user_id: Optional[str] = None  # Will come from auth in production
+    user_id: Optional[str] = None
 ):
     """
     Upload a DistroKid 'Excruciating Detail' file (TSV or XLSX)
-    Process it and return analytics
+    Process it and return analytics. Saves to DB if user_id provided.
     """
-    
-    # Validate file type
+
     if not file.filename.endswith(('.tsv', '.xlsx', '.xls', '.csv')):
         raise HTTPException(
             status_code=400,
             detail="Invalid file type. Please upload a TSV, XLSX, or CSV file."
         )
-    
+
     try:
-        # Read file content
         content = await file.read()
-        
-        # Parse based on file type
+
         if file.filename.endswith('.xlsx') or file.filename.endswith('.xls'):
             df = pd.read_excel(io.BytesIO(content))
         elif file.filename.endswith('.tsv'):
             df = pd.read_csv(io.BytesIO(content), sep='\t')
-        else:  # CSV
+        else:
             df = pd.read_csv(io.BytesIO(content))
-        
-        # Validate required columns
+
         required_columns = ['Sale Month', 'Store', 'Title', 'Quantity', 'Earnings (USD)']
         missing_columns = [col for col in required_columns if col not in df.columns]
-        
+
         if missing_columns:
             raise HTTPException(
                 status_code=400,
                 detail=f"Missing required columns: {missing_columns}. Please upload a DistroKid 'Excruciating Detail' export."
             )
-        
+
         # Run analytics
         analyzer = DistroKidAnalyzer(df)
         results = analyzer.get_full_analysis()
-        
+
+        # Extract date range
+        date_range_start = None
+        date_range_end = None
+        if 'Sale Month' in df.columns:
+            months = pd.to_datetime(df['Sale Month'], errors='coerce').dropna()
+            if len(months) > 0:
+                date_range_start = str(months.min().date())
+                date_range_end = str(months.max().date())
+
         # Add metadata
         results['metadata'] = {
             'filename': file.filename,
             'rows_processed': len(df),
-            'user_id': user_id
+            'user_id': user_id,
+            'date_range_start': date_range_start,
+            'date_range_end': date_range_end,
         }
-        
+
+        # Save to database if user_id provided and DB is configured
+        saved_id = None
+        if user_id and DB_ENABLED:
+            try:
+                db = get_db()
+                saved = db.save_analysis(
+                    user_id=user_id,
+                    filename=file.filename,
+                    row_count=len(df),
+                    date_range_start=date_range_start,
+                    date_range_end=date_range_end,
+                    result=results,
+                )
+                saved_id = saved.get("id")
+            except Exception as db_err:
+                # Log but don't fail the request
+                print(f"Warning: Failed to save analysis to DB: {db_err}")
+
+        results['metadata']['saved_id'] = saved_id
+
         return JSONResponse(content=results)
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -99,48 +137,54 @@ async def upload_file(
         )
 
 
-@app.get("/dashboard/{user_id}")
-async def get_dashboard(user_id: str):
-    """
-    Get cached dashboard data for a user
-    """
-    # TODO: Implement database lookup
-    return {"message": "Dashboard endpoint", "user_id": user_id}
+@app.get("/analyses/{user_id}")
+async def get_analyses(user_id: str):
+    """Get list of saved analyses for a user (metadata only, no full results)"""
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    try:
+        db = get_db()
+        analyses = db.get_user_analyses(user_id)
+        return JSONResponse(content={"analyses": analyses})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching analyses: {str(e)}")
 
 
-@app.get("/dashboard/{user_id}/overview")
-async def get_overview(user_id: str):
-    """Get overview metrics for user"""
-    # TODO: Implement
-    pass
+@app.get("/analyses/{user_id}/{analysis_id}")
+async def get_analysis(user_id: str, analysis_id: str):
+    """Get a single saved analysis with full results"""
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    try:
+        db = get_db()
+        analysis = db.get_analysis_by_id(analysis_id, user_id)
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        return JSONResponse(content=analysis)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching analysis: {str(e)}")
 
 
-@app.get("/dashboard/{user_id}/songs")
-async def get_songs(user_id: str):
-    """Get song breakdown for user"""
-    # TODO: Implement
-    pass
+@app.delete("/analyses/{user_id}/{analysis_id}")
+async def delete_analysis(user_id: str, analysis_id: str):
+    """Delete a saved analysis"""
+    if not DB_ENABLED:
+        raise HTTPException(status_code=503, detail="Database not configured")
 
-
-@app.get("/dashboard/{user_id}/platforms")
-async def get_platforms(user_id: str):
-    """Get platform breakdown for user"""
-    # TODO: Implement
-    pass
-
-
-@app.get("/dashboard/{user_id}/countries")
-async def get_countries(user_id: str):
-    """Get country breakdown for user"""
-    # TODO: Implement
-    pass
-
-
-@app.get("/dashboard/{user_id}/trends")
-async def get_trends(user_id: str):
-    """Get monthly trends for user"""
-    # TODO: Implement
-    pass
+    try:
+        db = get_db()
+        deleted = db.delete_analysis(analysis_id, user_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting analysis: {str(e)}")
 
 
 if __name__ == "__main__":
