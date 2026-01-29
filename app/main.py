@@ -8,10 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
 import io
+import os
 from typing import Optional
 
 from .analytics_engine import DistroKidAnalyzer
-from .database import get_supabase_client, save_upload, save_streams_data, get_user_data
 
 app = FastAPI(
     title="Farrar Analytics API",
@@ -19,10 +19,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS - update origins for production
+# CORS
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:4321,https://farraranalytics.com").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://farraranalytics.com"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
