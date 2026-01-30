@@ -207,7 +207,9 @@ async def get_analysis(user_id: str, analysis_id: str):
         analysis = db.get_analysis_by_id(analysis_id, user_id)
         if not analysis:
             raise HTTPException(status_code=404, detail="Analysis not found")
-        return JSONResponse(content=sanitize_for_json(analysis))
+        # Return the result object directly (same shape as /upload response)
+        result = analysis.get("result", analysis)
+        return JSONResponse(content=sanitize_for_json(result))
     except HTTPException:
         raise
     except Exception as e:
