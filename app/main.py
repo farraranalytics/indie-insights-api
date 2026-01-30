@@ -3,7 +3,7 @@ Farrar Analytics - Indie Artist Insights API
 Main FastAPI application
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas as pd
@@ -73,7 +73,7 @@ async def health_check():
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    user_id: Optional[str] = None
+    user_id: Optional[str] = Form(None)
 ):
     """
     Upload a DistroKid 'Excruciating Detail' file (TSV or XLSX)
