@@ -308,8 +308,52 @@ class DistroKidAnalyzer:
             "top_songs": songs.head(10).to_dict('records')
         }
     
+    def get_monthly_breakdown(self) -> List[Dict]:
+        """
+        Get GRANULAR monthly breakdown by song, platform, and country.
+        
+        This is the source-of-truth data that enables accurate client-side filtering.
+        Each row represents a unique (month, song, platform, country) combination.
+        
+        Returns a list of dicts with:
+            - month: YYYY-MM format
+            - song: Song title
+            - platform: Store/platform name
+            - country: Country code
+            - earnings: Total earnings for this combination
+            - streams: Total streams for this combination
+        """
+        # Create a month string column for grouping (YYYY-MM format)
+        df_copy = self.df.copy()
+        df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
+        
+        # Group by all four dimensions
+        breakdown = df_copy.groupby([
+            'month_str',
+            'Title',
+            'Store', 
+            'Country of Sale'
+        ]).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum'
+        }).reset_index()
+        
+        # Rename columns for clarity
+        breakdown.columns = ['month', 'song', 'platform', 'country', 'streams', 'earnings']
+        
+        # Round earnings to 2 decimal places
+        breakdown['earnings'] = breakdown['earnings'].round(2)
+        
+        # Convert streams to int
+        breakdown['streams'] = breakdown['streams'].astype(int)
+        
+        # Sort by month, then earnings descending
+        breakdown = breakdown.sort_values(['month', 'earnings'], ascending=[True, False])
+        
+        return breakdown.to_dict('records')
+    
     def get_full_analysis(self) -> Dict[str, Any]:
-        """Get complete analysis - all metrics"""
+        """Get complete analysis - all metrics including granular breakdown"""
         return {
             "overview": self.get_overview(),
             "monthly_trend": self.get_monthly_trend(),
@@ -321,7 +365,9 @@ class DistroKidAnalyzer:
             "growth": self.get_growth_analysis(),
             "platform_song_matrix": self.get_platform_song_matrix(),
             "market_analysis": self.get_high_value_markets(),
-            "catalog_depth": self.get_catalog_excluding_top_song()
+            "catalog_depth": self.get_catalog_excluding_top_song(),
+            # NEW: Granular data for client-side filtering
+            "monthly_breakdown": self.get_monthly_breakdown(),
         }
 
 
@@ -342,5 +388,12 @@ if __name__ == "__main__":
         
         import json
         print(json.dumps(results, indent=2))
+        
+        # Print breakdown stats
+        breakdown = results.get('monthly_breakdown', [])
+        print(f"\n--- Monthly Breakdown Stats ---")
+        print(f"Total rows: {len(breakdown)}")
+        if breakdown:
+            print(f"Sample row: {breakdown[0]}")
     else:
         print("Usage: python analytics_engine.py <path_to_distrokid_export>")
