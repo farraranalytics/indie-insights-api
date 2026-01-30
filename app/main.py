@@ -9,9 +9,18 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 import io
 import os
+import logging
+import asyncio
+from functools import partial
 from typing import Optional
 
 from .analytics_engine import DistroKidAnalyzer
+
+logger = logging.getLogger("indie-insights")
+logging.basicConfig(level=logging.INFO)
+
+# 10 MB file size limit
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "10")) * 1024 * 1024
 
 app = FastAPI(
     title="Farrar Analytics API",
@@ -67,13 +76,29 @@ async def upload_file(
 
     try:
         content = await file.read()
+        file_size = len(content)
+        logger.info(f"Upload received: {file.filename} ({file_size / 1024:.1f} KB)")
+
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({file_size / 1024 / 1024:.1f} MB). Maximum size is {MAX_FILE_SIZE // 1024 // 1024} MB."
+            )
+
+        if file_size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        # Parse file in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
 
         if file.filename.endswith('.xlsx') or file.filename.endswith('.xls'):
-            df = pd.read_excel(io.BytesIO(content))
+            df = await loop.run_in_executor(None, partial(pd.read_excel, io.BytesIO(content)))
         elif file.filename.endswith('.tsv'):
-            df = pd.read_csv(io.BytesIO(content), sep='\t')
+            df = await loop.run_in_executor(None, partial(pd.read_csv, io.BytesIO(content), sep='\t'))
         else:
-            df = pd.read_csv(io.BytesIO(content))
+            df = await loop.run_in_executor(None, partial(pd.read_csv, io.BytesIO(content)))
+
+        logger.info(f"Parsed {len(df)} rows from {file.filename}")
 
         required_columns = ['Sale Month', 'Store', 'Title', 'Quantity', 'Earnings (USD)']
         missing_columns = [col for col in required_columns if col not in df.columns]
@@ -84,9 +109,12 @@ async def upload_file(
                 detail=f"Missing required columns: {missing_columns}. Please upload a DistroKid 'Excruciating Detail' export."
             )
 
-        # Run analytics
-        analyzer = DistroKidAnalyzer(df)
-        results = analyzer.get_full_analysis()
+        # Run analytics in thread pool to avoid blocking the event loop
+        def run_analysis(dataframe):
+            analyzer = DistroKidAnalyzer(dataframe)
+            return analyzer.get_full_analysis()
+
+        results = await loop.run_in_executor(None, run_analysis, df)
 
         # Extract date range
         date_range_start = None
@@ -106,6 +134,8 @@ async def upload_file(
             'date_range_end': date_range_end,
         }
 
+        logger.info(f"Analysis complete for {file.filename}")
+
         # Save to database if user_id provided and DB is configured
         saved_id = None
         if user_id and DB_ENABLED:
@@ -120,9 +150,9 @@ async def upload_file(
                     result=results,
                 )
                 saved_id = saved.get("id")
+                logger.info(f"Saved analysis {saved_id} for user {user_id}")
             except Exception as db_err:
-                # Log but don't fail the request
-                print(f"Warning: Failed to save analysis to DB: {db_err}")
+                logger.warning(f"Failed to save analysis to DB: {db_err}")
 
         results['metadata']['saved_id'] = saved_id
 
@@ -131,6 +161,7 @@ async def upload_file(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error processing file {file.filename}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error processing file: {str(e)}"
