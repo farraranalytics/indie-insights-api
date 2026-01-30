@@ -11,6 +11,7 @@ import io
 import os
 import logging
 import asyncio
+import math
 from functools import partial
 from typing import Optional
 
@@ -18,6 +19,17 @@ from .analytics_engine import DistroKidAnalyzer
 
 logger = logging.getLogger("indie-insights")
 logging.basicConfig(level=logging.INFO)
+
+
+def sanitize_for_json(obj):
+    """Replace NaN/Infinity floats with None so the response is valid JSON."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    return obj
 
 # 50 MB file size limit
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
@@ -156,7 +168,7 @@ async def upload_file(
 
         results['metadata']['saved_id'] = saved_id
 
-        return JSONResponse(content=results)
+        return JSONResponse(content=sanitize_for_json(results))
 
     except HTTPException:
         raise
@@ -193,7 +205,7 @@ async def get_analysis(user_id: str, analysis_id: str):
         analysis = db.get_analysis_by_id(analysis_id, user_id)
         if not analysis:
             raise HTTPException(status_code=404, detail="Analysis not found")
-        return JSONResponse(content=analysis)
+        return JSONResponse(content=sanitize_for_json(analysis))
     except HTTPException:
         raise
     except Exception as e:
