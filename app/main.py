@@ -150,6 +150,7 @@ async def upload_file(
 
         # Save to database if user_id provided and DB is configured
         saved_id = None
+        logger.info(f"Upload user_id={user_id}, DB_ENABLED={DB_ENABLED}")
         if user_id and DB_ENABLED:
             try:
                 db = get_db()
@@ -191,6 +192,7 @@ async def get_analyses(user_id: str):
         analyses = db.get_user_analyses(user_id)
         return JSONResponse(content={"analyses": analyses})
     except Exception as e:
+        logger.error(f"Error fetching analyses for user {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error fetching analyses: {str(e)}")
 
 
@@ -209,6 +211,7 @@ async def get_analysis(user_id: str, analysis_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error fetching analysis {analysis_id} for user {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error fetching analysis: {str(e)}")
 
 
