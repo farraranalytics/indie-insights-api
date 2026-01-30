@@ -19,8 +19,8 @@ from .analytics_engine import DistroKidAnalyzer
 logger = logging.getLogger("indie-insights")
 logging.basicConfig(level=logging.INFO)
 
-# 10 MB file size limit
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "10")) * 1024 * 1024
+# 50 MB file size limit
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 
 app = FastAPI(
     title="Farrar Analytics API",
