@@ -46,7 +46,16 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "db_enabled": DB_ENABLED}
+    has_url = bool(os.getenv("SUPABASE_URL"))
+    has_key = bool(os.getenv("SUPABASE_SERVICE_KEY"))
+    return {
+        "status": "healthy",
+        "db_enabled": DB_ENABLED,
+        "has_url": has_url,
+        "has_key": has_key,
+        "url_len": len(os.getenv("SUPABASE_URL", "")),
+        "key_len": len(os.getenv("SUPABASE_SERVICE_KEY", "")),
+    }
 
 
 @app.post("/upload")
