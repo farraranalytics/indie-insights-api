@@ -24,6 +24,9 @@ class DistroKidAnalyzer:
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self._prepare_data()
+        self._has_upc = 'UPC' in self.df.columns
+        if self._has_upc:
+            self._build_release_classification()
     
     def _prepare_data(self):
         """Clean and prepare the dataframe"""
@@ -38,6 +41,185 @@ class DistroKidAnalyzer:
         self.df['Year'] = self.df['Sale Month'].dt.year
         self.df['Quarter'] = self.df['Sale Month'].dt.to_period('Q').astype(str)
     
+    # Platforms where album/EP-level purchases appear (not individual songs)
+    PURCHASE_PLATFORMS = {'iTunes', 'Amazon (Downloads)', 'iTunes Songs'}
+
+    def _build_release_classification(self):
+        """Build release type lookup from UPC → track count → classification.
+
+        Detects album/EP names by finding titles that ONLY appear on purchase
+        platforms within a UPC. These are album-level purchase entries, not real
+        tracks. They get used as the release_name and filtered from track counts.
+        """
+        # Ensure UPC is string for consistent grouping/serialization
+        self.df['UPC'] = self.df['UPC'].astype(str)
+
+        # Drop rows with missing/empty UPC
+        valid_mask = self.df['UPC'].notna() & (self.df['UPC'] != '') & (self.df['UPC'] != 'nan')
+        if not valid_mask.any():
+            self._has_upc = False
+            return
+
+        valid_df = self.df.loc[valid_mask]
+
+        # For each UPC, find titles that only appear on purchase platforms.
+        # These are album/EP name entries, not actual songs.
+        album_name_rows = {}  # UPC -> set of album-name titles
+        for upc, group in valid_df.groupby('UPC'):
+            album_titles = set()
+            for title, tgroup in group.groupby('Title'):
+                stores = set(tgroup['Store'].unique())
+                if stores.issubset(self.PURCHASE_PLATFORMS):
+                    album_titles.add(title)
+            # Only treat as album names if the UPC has OTHER titles too
+            all_titles = set(group['Title'].unique())
+            if album_titles and (all_titles - album_titles):
+                album_name_rows[upc] = album_titles
+
+        # Build a mask for album-name rows (to exclude from track counting)
+        is_album_name = self.df.apply(
+            lambda row: row['Title'] in album_name_rows.get(str(row['UPC']), set()),
+            axis=1
+        )
+        self.df['is_album_name_entry'] = is_album_name
+
+        # Count unique REAL titles per UPC (excluding album-name entries)
+        real_tracks = self.df.loc[valid_mask & ~is_album_name]
+        upc_tracks = real_tracks.groupby('UPC')['Title'].nunique().reset_index()
+        upc_tracks.columns = ['UPC', 'track_count']
+
+        # Classify: Single (1), EP (2-6), Album (7+)
+        def classify(count: int) -> str:
+            if count <= 1:
+                return 'Single'
+            elif count <= 6:
+                return 'EP'
+            else:
+                return 'Album'
+
+        upc_tracks['release_type'] = upc_tracks['track_count'].apply(classify)
+
+        # Build release name:
+        # - If we found a purchase-only album name, use it
+        # - Otherwise fall back to the first song title (for singles)
+        def get_release_name(upc):
+            names = album_name_rows.get(upc)
+            if names:
+                return sorted(names)[0]
+            # Fall back to first real title alphabetically
+            titles = real_tracks.loc[real_tracks['UPC'] == upc, 'Title'].unique()
+            return sorted(titles)[0] if len(titles) > 0 else upc
+
+        upc_tracks['release_name'] = upc_tracks['UPC'].apply(get_release_name)
+
+        self._release_lookup = upc_tracks.set_index('UPC')
+
+        # Merge release_type, track_count, and release_name onto the main dataframe
+        self.df = self.df.merge(
+            upc_tracks[['UPC', 'release_type', 'track_count', 'release_name']],
+            on='UPC',
+            how='left'
+        )
+        # Rows with invalid UPC get 'Unknown' release_type
+        self.df['release_type'] = self.df['release_type'].fillna('Unknown')
+
+    def get_release_breakdown(self) -> Dict[str, Any]:
+        """Get release metadata: each UPC with its classification, earnings, and streams."""
+        if not self._has_upc:
+            return {"available": False, "reason": "No UPC column found in data"}
+
+        releases = self.df.groupby('UPC').agg({
+            'Title': 'nunique',
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'release_type': 'first',
+            'track_count': 'first',
+        }).reset_index()
+
+        # Add release name
+        release_names = self._release_lookup['release_name']
+        releases = releases.merge(
+            release_names.reset_index(),
+            on='UPC',
+            how='left'
+        )
+
+        releases = releases.rename(columns={
+            'Title': 'unique_tracks',
+            'Quantity': 'streams',
+            'Earnings (USD)': 'earnings',
+        })
+        releases['earnings'] = releases['earnings'].round(2)
+        releases['streams'] = releases['streams'].astype(int)
+        releases['track_count'] = releases['track_count'].astype(int)
+        releases = releases.sort_values('earnings', ascending=False)
+
+        # Detect cross-released songs (titles appearing on multiple UPCs)
+        title_upc = self.df.groupby('Title')['UPC'].nunique()
+        cross_released = title_upc[title_upc > 1].reset_index()
+        cross_released.columns = ['title', 'release_count']
+        cross_released = cross_released.sort_values('release_count', ascending=False)
+
+        return {
+            "available": True,
+            "releases": releases[['UPC', 'release_name', 'release_type', 'track_count',
+                                   'streams', 'earnings']].to_dict('records'),
+            "cross_released_songs": cross_released.to_dict('records'),
+        }
+
+    def get_release_type_summary(self) -> Dict[str, Any]:
+        """Summarize performance by release type (Single / EP / Album)."""
+        if not self._has_upc:
+            return {"available": False, "reason": "No UPC column found in data"}
+
+        total_earnings = self.df['Earnings (USD)'].sum()
+        total_streams = self.df['Quantity'].sum()
+
+        summary = self.df.groupby('release_type').agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'UPC': 'nunique',
+            'Title': 'nunique',
+        }).reset_index()
+
+        summary.columns = ['release_type', 'streams', 'earnings', 'release_count', 'track_count']
+        summary['earnings'] = summary['earnings'].round(2)
+        summary['streams'] = summary['streams'].astype(int)
+        summary['release_count'] = summary['release_count'].astype(int)
+        summary['track_count'] = summary['track_count'].astype(int)
+        summary['pct_of_earnings'] = (summary['earnings'] / total_earnings * 100).round(1) if total_earnings > 0 else 0
+        summary['pct_of_streams'] = (summary['streams'] / total_streams * 100).round(1) if total_streams > 0 else 0
+        summary['per_stream'] = (summary['earnings'] / summary['streams']).round(4)
+        summary = summary.replace([np.inf, -np.inf], np.nan).fillna(0)
+        summary = summary.sort_values('earnings', ascending=False)
+
+        return {
+            "available": True,
+            "summary": summary.to_dict('records'),
+        }
+
+    def get_release_type_monthly_trend(self) -> Dict[str, Any]:
+        """Monthly earnings trend split by release type."""
+        if not self._has_upc:
+            return {"available": False, "reason": "No UPC column found in data"}
+
+        monthly = self.df.groupby([
+            self.df['Sale Month'].dt.strftime('%Y-%m'),
+            'release_type'
+        ]).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+        }).reset_index()
+
+        monthly.columns = ['month', 'release_type', 'streams', 'earnings']
+        monthly['earnings'] = monthly['earnings'].round(2)
+        monthly = monthly.sort_values(['month', 'release_type'])
+
+        return {
+            "available": True,
+            "monthly": monthly.to_dict('records'),
+        }
+
     def get_overview(self) -> Dict[str, Any]:
         """Get high-level summary statistics"""
         total_earnings = float(self.df['Earnings (USD)'].sum())
@@ -327,19 +509,21 @@ class DistroKidAnalyzer:
         df_copy = self.df.copy()
         df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
         
-        # Group by all four dimensions
-        breakdown = df_copy.groupby([
-            'month_str',
-            'Title',
-            'Store', 
-            'Country of Sale'
-        ]).agg({
+        # Group by all dimensions (include release fields if available)
+        group_cols = ['month_str', 'Title', 'Store', 'Country of Sale']
+        if self._has_upc:
+            group_cols.extend(['release_type', 'release_name'])
+
+        breakdown = df_copy.groupby(group_cols).agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
-        
+
         # Rename columns for clarity
-        breakdown.columns = ['month', 'song', 'platform', 'country', 'streams', 'earnings']
+        if self._has_upc:
+            breakdown.columns = ['month', 'song', 'platform', 'country', 'release_type', 'release_name', 'streams', 'earnings']
+        else:
+            breakdown.columns = ['month', 'song', 'platform', 'country', 'streams', 'earnings']
         
         # Round earnings to 2 decimal places
         breakdown['earnings'] = breakdown['earnings'].round(2)
@@ -366,8 +550,12 @@ class DistroKidAnalyzer:
             "platform_song_matrix": self.get_platform_song_matrix(),
             "market_analysis": self.get_high_value_markets(),
             "catalog_depth": self.get_catalog_excluding_top_song(),
-            # NEW: Granular data for client-side filtering
+            # Granular data for client-side filtering
             "monthly_breakdown": self.get_monthly_breakdown(),
+            # Release classification (Singles / EPs / Albums via UPC)
+            "release_breakdown": self.get_release_breakdown(),
+            "release_type_summary": self.get_release_type_summary(),
+            "release_type_monthly_trend": self.get_release_type_monthly_trend(),
         }
 
 
