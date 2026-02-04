@@ -249,20 +249,36 @@ class DistroKidAnalyzer:
         }
 
     def get_release_type_monthly_trend(self) -> Dict[str, Any]:
-        """Monthly earnings trend split by release type."""
+        """Monthly earnings trend split by release type, with per_stream and song_count."""
         if not self._has_upc:
             return {"available": False, "reason": "No UPC column found in data"}
 
-        monthly = self.df.groupby([
-            self.df['Sale Month'].dt.strftime('%Y-%m'),
-            'release_type'
-        ]).agg({
+        month_col = self.df['Sale Month'].dt.strftime('%Y-%m')
+
+        monthly = self.df.groupby([month_col, 'release_type']).agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum',
+            'Title': 'nunique',
         }).reset_index()
+        monthly.columns = ['month', 'release_type', 'streams', 'earnings', 'song_count']
 
-        monthly.columns = ['month', 'release_type', 'streams', 'earnings']
+        # Per-stream from streaming data (gross for true rate)
+        str_month_col = self._streaming_df['Sale Month'].dt.strftime('%Y-%m')
+        str_monthly = self._streaming_df.groupby([str_month_col, 'release_type']).agg({
+            'Quantity': 'sum', 'gross_earnings': 'sum',
+        }).reset_index()
+        str_monthly.columns = ['month', 'release_type', 'str_streams', 'gross_earnings']
+        str_monthly['per_stream'] = (str_monthly['gross_earnings'] / str_monthly['str_streams']).round(4)
+
+        monthly = monthly.merge(
+            str_monthly[['month', 'release_type', 'gross_earnings', 'per_stream']],
+            on=['month', 'release_type'], how='left'
+        )
+
         monthly['earnings'] = monthly['earnings'].round(2)
+        monthly['gross_earnings'] = monthly['gross_earnings'].round(2).fillna(0)
+        monthly['per_stream'] = monthly['per_stream'].fillna(0)
+        monthly = monthly.replace([np.inf, -np.inf], np.nan).fillna(0)
         monthly = monthly.sort_values(['month', 'release_type'])
 
         return {
@@ -316,19 +332,51 @@ class DistroKidAnalyzer:
         return monthly.to_dict('records')
     
     def get_yearly_trend(self) -> List[Dict]:
-        """Get earnings and streams by year"""
+        """Get earnings and streams by year with per_stream, top song, top platform."""
         yearly = self.df.groupby('Year').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
-        
+
         yearly.columns = ['year', 'streams', 'earnings']
         yearly['earnings'] = yearly['earnings'].round(2)
-        
+
         # Calculate YoY change
         yearly['yoy_change_pct'] = yearly['earnings'].pct_change() * 100
         yearly['yoy_change_pct'] = yearly['yoy_change_pct'].round(1).fillna(0)
-        
+
+        # Per-stream from streaming data (gross for true rate)
+        str_yearly = self._streaming_df.groupby('Year').agg({
+            'Quantity': 'sum', 'gross_earnings': 'sum'
+        }).reset_index()
+        str_yearly.columns = ['year', 'str_streams', 'str_gross']
+        str_yearly['per_stream'] = (str_yearly['str_gross'] / str_yearly['str_streams']).round(4)
+        yearly = yearly.merge(str_yearly[['year', 'per_stream']], on='year', how='left')
+
+        # Song count per year
+        song_counts = self.df.groupby('Year')['Title'].nunique().reset_index()
+        song_counts.columns = ['year', 'song_count']
+        yearly = yearly.merge(song_counts, on='year', how='left')
+
+        # Top song per year (by earnings)
+        top_songs = self.df.groupby(['Year', 'Title'])['Earnings (USD)'].sum().reset_index()
+        top_songs = top_songs.sort_values(['Year', 'Earnings (USD)'], ascending=[True, False])
+        top_song_by_year = top_songs.groupby('Year').first().reset_index()[['Year', 'Title']]
+        top_song_by_year.columns = ['year', 'top_song']
+        yearly = yearly.merge(top_song_by_year, on='year', how='left')
+
+        # Top platform per year (by earnings)
+        top_plats = self.df.groupby(['Year', 'Store'])['Earnings (USD)'].sum().reset_index()
+        top_plats = top_plats.sort_values(['Year', 'Earnings (USD)'], ascending=[True, False])
+        top_plat_by_year = top_plats.groupby('Year').first().reset_index()[['Year', 'Store']]
+        top_plat_by_year.columns = ['year', 'top_platform']
+        yearly = yearly.merge(top_plat_by_year, on='year', how='left')
+
+        yearly = yearly.replace([np.inf, -np.inf], np.nan).fillna(0)
+        # Ensure string columns don't become 0
+        yearly['top_song'] = yearly['top_song'].replace(0, '')
+        yearly['top_platform'] = yearly['top_platform'].replace(0, '')
+
         return yearly.to_dict('records')
     
     def get_song_breakdown(self, limit: int = 20) -> List[Dict]:
@@ -463,7 +511,13 @@ class DistroKidAnalyzer:
         growth['change'] = growth['recent'] - growth['previous']
         growth['change_pct'] = ((growth['recent'] / growth['previous']) - 1) * 100
         growth = growth.replace([np.inf, -np.inf], np.nan)
-        
+
+        # Filter to songs with meaningful stream volume in the recent period
+        recent_streams = self._streaming_df[self._streaming_df['Sale Month'] > recent_start].groupby('Title')['Quantity'].sum()
+        growth['recent_streams'] = recent_streams.reindex(growth.index).fillna(0)
+        growth = growth[growth['recent_streams'] >= 1000]
+        growth = growth.drop(columns=['recent_streams'])
+
         growing = growth[growth['change'] > 0].sort_values('change', ascending=False).head(5)
         declining = growth[growth['change'] < 0].sort_values('change', ascending=True).head(5)
         
@@ -506,7 +560,7 @@ class DistroKidAnalyzer:
                 (gross_by_store / platforms['Quantity']).round(4),
                 np.nan
             )
-            platforms['pct'] = platforms['Earnings (USD)'] / platforms['Earnings (USD)'].sum() * 100
+            platforms['pct_of_song_total'] = platforms['Earnings (USD)'] / platforms['Earnings (USD)'].sum() * 100
             platforms = platforms.sort_values('Earnings (USD)', ascending=False)
 
             results.append({
@@ -516,7 +570,7 @@ class DistroKidAnalyzer:
                         "platform": platform,
                         "earnings": round(row['Earnings (USD)'], 2),
                         "per_stream": round(row['per_stream'], 4) if not pd.isna(row['per_stream']) else None,
-                        "pct": round(row['pct'], 1)
+                        "pct_of_song_total": round(row['pct_of_song_total'], 1)
                     }
                     for platform, row in platforms.head(5).iterrows()
                 ]
@@ -653,6 +707,116 @@ class DistroKidAnalyzer:
         return breakdown.to_dict('records')
     
     # ------------------------------------------------------------------
+    # Filterable Aggregations (for frontend client-side filtering)
+    # ------------------------------------------------------------------
+
+    def get_platform_country_breakdown(self) -> Dict[str, Any]:
+        """Platform + country + month granularity, streaming only, with per_stream."""
+        sdf = self._streaming_df
+        if sdf.empty:
+            return {"available": False, "reason": "No streaming data available"}
+
+        df_copy = sdf.copy()
+        df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
+
+        agg = df_copy.groupby(['Store', 'Country of Sale', 'month_str']).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+        }).reset_index()
+        agg.columns = ['platform', 'country', 'month', 'streams', 'earnings', 'gross_earnings']
+
+        # Filter out low-volume noise
+        agg = agg[agg['streams'] >= 100]
+
+        agg['per_stream'] = (agg['gross_earnings'] / agg['streams']).round(4)
+        agg['earnings'] = agg['earnings'].round(2)
+        agg['gross_earnings'] = agg['gross_earnings'].round(2)
+        agg['streams'] = agg['streams'].astype(int)
+        agg = agg.replace([np.inf, -np.inf], np.nan).fillna(0)
+        agg = agg.sort_values(['platform', 'country', 'month'])
+
+        return agg.to_dict('records')
+
+    def get_song_monthly_performance(self) -> Dict[str, Any]:
+        """Song + month, streaming only, with per_stream."""
+        sdf = self._streaming_df
+        if sdf.empty:
+            return {"available": False, "reason": "No streaming data available"}
+
+        df_copy = sdf.copy()
+        df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
+
+        agg = df_copy.groupby(['Title', 'month_str']).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+        }).reset_index()
+        agg.columns = ['song', 'month', 'streams', 'earnings', 'gross_earnings']
+
+        agg['per_stream'] = (agg['gross_earnings'] / agg['streams']).round(4)
+        agg['earnings'] = agg['earnings'].round(2)
+        agg['gross_earnings'] = agg['gross_earnings'].round(2)
+        agg['streams'] = agg['streams'].astype(int)
+        agg = agg.replace([np.inf, -np.inf], np.nan).fillna(0)
+        agg = agg.sort_values(['song', 'month'])
+
+        return agg.to_dict('records')
+
+    def get_country_monthly_performance(self) -> Dict[str, Any]:
+        """Country + month, streaming only, with per_stream."""
+        sdf = self._streaming_df
+        if sdf.empty:
+            return {"available": False, "reason": "No streaming data available"}
+
+        df_copy = sdf.copy()
+        df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
+
+        agg = df_copy.groupby(['Country of Sale', 'month_str']).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+        }).reset_index()
+        agg.columns = ['country', 'month', 'streams', 'earnings', 'gross_earnings']
+
+        # Filter out low-volume noise
+        agg = agg[agg['streams'] >= 50]
+
+        agg['per_stream'] = (agg['gross_earnings'] / agg['streams']).round(4)
+        agg['earnings'] = agg['earnings'].round(2)
+        agg['gross_earnings'] = agg['gross_earnings'].round(2)
+        agg['streams'] = agg['streams'].astype(int)
+        agg = agg.replace([np.inf, -np.inf], np.nan).fillna(0)
+        agg = agg.sort_values(['country', 'month'])
+
+        return agg.to_dict('records')
+
+    def get_platform_monthly_breakdown(self) -> Dict[str, Any]:
+        """Platform + month, streaming only, with per_stream."""
+        sdf = self._streaming_df
+        if sdf.empty:
+            return {"available": False, "reason": "No streaming data available"}
+
+        df_copy = sdf.copy()
+        df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
+
+        agg = df_copy.groupby(['Store', 'month_str']).agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+        }).reset_index()
+        agg.columns = ['platform', 'month', 'streams', 'earnings', 'gross_earnings']
+
+        agg['per_stream'] = (agg['gross_earnings'] / agg['streams']).round(4)
+        agg['earnings'] = agg['earnings'].round(2)
+        agg['gross_earnings'] = agg['gross_earnings'].round(2)
+        agg['streams'] = agg['streams'].astype(int)
+        agg = agg.replace([np.inf, -np.inf], np.nan).fillna(0)
+        agg = agg.sort_values(['platform', 'month'])
+
+        return agg.to_dict('records')
+
+    # ------------------------------------------------------------------
     # Ownership & Release Strategy Analysis
     # ------------------------------------------------------------------
 
@@ -746,7 +910,7 @@ class DistroKidAnalyzer:
                 }).reset_index()
 
                 total_s = int(by_type['Quantity'].sum())
-                if total_s == 0:
+                if total_s < 1000:
                     continue
 
                 single_row = by_type[by_type['release_type'] == 'Single']
@@ -934,6 +1098,11 @@ class DistroKidAnalyzer:
             # Ownership & release strategy
             "ownership_summary": self.get_ownership_summary(),
             "release_strategy_analysis": self.get_release_strategy_analysis(),
+            # Filterable aggregations (for frontend client-side filtering)
+            "platform_country_breakdown": self.get_platform_country_breakdown(),
+            "song_monthly_performance": self.get_song_monthly_performance(),
+            "country_monthly_performance": self.get_country_monthly_performance(),
+            "platform_monthly_breakdown": self.get_platform_monthly_breakdown(),
         }
 
         # Deep insights (ML-driven) — graceful degradation if libs missing

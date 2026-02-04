@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 # Thresholds
 MIN_STREAMS_FOR_RATE = 1000
+MIN_STREAMS_FOR_RATE_ANALYSIS = 10000
+MIN_EARNINGS_FOR_MATRIX = 50
+MIN_PER_STREAM_FOR_MATRIX = 0.0001
+MIN_EARNINGS_FOR_ANOMALY = 500
+MIN_EARNINGS_FOR_SONG_ANOMALY = 50
 MIN_MONTHS_FOR_FORECAST = 12
 MIN_MONTHS_FOR_SEASONALITY = 24
 MIN_ROWS_FOR_CLUSTERING = 5
@@ -107,6 +112,30 @@ class InsightsEngine:
             rtq = rtq.sort_values(['release_type', 'quarter'])
             result['by_release_type_quarter'] = rtq.to_dict('records')
 
+        # By platform x month (for time-filtered $/stream charts)
+        plat_monthly = sdf.groupby(['Store', sdf['Sale Month'].dt.strftime('%Y-%m')]).agg({
+            'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'
+        }).reset_index()
+        plat_monthly.columns = ['platform', 'month', 'streams', 'earnings', 'gross_earnings']
+        plat_monthly = plat_monthly[plat_monthly['streams'] >= MIN_STREAMS_FOR_RATE]
+        plat_monthly['per_stream'] = (plat_monthly['gross_earnings'] / plat_monthly['streams']).round(4)
+        plat_monthly = plat_monthly.drop(columns=['gross_earnings'])
+        plat_monthly['earnings'] = plat_monthly['earnings'].round(2)
+        plat_monthly = plat_monthly.sort_values(['platform', 'month'])
+        result['by_platform_monthly'] = plat_monthly.to_dict('records')
+
+        # By country x month (for time-filtered $/stream charts)
+        ctry_monthly = sdf.groupby(['Country of Sale', sdf['Sale Month'].dt.strftime('%Y-%m')]).agg({
+            'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'
+        }).reset_index()
+        ctry_monthly.columns = ['country', 'month', 'streams', 'earnings', 'gross_earnings']
+        ctry_monthly = ctry_monthly[ctry_monthly['streams'] >= MIN_STREAMS_FOR_RATE]
+        ctry_monthly['per_stream'] = (ctry_monthly['gross_earnings'] / ctry_monthly['streams']).round(4)
+        ctry_monthly = ctry_monthly.drop(columns=['gross_earnings'])
+        ctry_monthly['earnings'] = ctry_monthly['earnings'].round(2)
+        ctry_monthly = ctry_monthly.sort_values(['country', 'month'])
+        result['by_country_monthly'] = ctry_monthly.to_dict('records')
+
         return self._clean(result)
 
     def get_song_rate_drivers(self, top_n: int = 10) -> Dict[str, Any]:
@@ -119,8 +148,10 @@ class InsightsEngine:
         total_gross = sdf['gross_earnings'].sum()
         catalog_avg = total_gross / total_streams if total_streams > 0 else 0
 
-        # Top songs by total earnings (full df)
-        top_songs = self.df.groupby('Title')['Earnings (USD)'].sum().sort_values(ascending=False).head(top_n).index
+        # Filter to songs with meaningful streaming volume, then take top by earnings
+        song_stream_totals = sdf.groupby('Title')['Quantity'].sum()
+        eligible_songs = song_stream_totals[song_stream_totals >= MIN_STREAMS_FOR_RATE_ANALYSIS].index
+        top_songs = self.df[self.df['Title'].isin(eligible_songs)].groupby('Title')['Earnings (USD)'].sum().sort_values(ascending=False).head(top_n).index
 
         drivers = []
         for song in top_songs:
@@ -167,6 +198,30 @@ class InsightsEngine:
                 "platform_count": platform_count,
             }
 
+            # Per-platform breakdown for this song
+            plat_detail = song_streaming.groupby('Store').agg({
+                'Quantity': 'sum', 'gross_earnings': 'sum', 'Earnings (USD)': 'sum'
+            }).reset_index()
+            plat_detail = plat_detail[plat_detail['Quantity'] >= 100]
+            plat_detail['per_stream'] = (plat_detail['gross_earnings'] / plat_detail['Quantity']).round(4)
+            plat_detail['pct_of_streams'] = (plat_detail['Quantity'] / song_streams * 100).round(1) if song_streams > 0 else 0
+            plat_detail = plat_detail.sort_values('Quantity', ascending=False)
+            entry['by_platform'] = plat_detail[['Store', 'Quantity', 'Earnings (USD)', 'per_stream', 'pct_of_streams']].rename(
+                columns={'Store': 'platform', 'Quantity': 'streams', 'Earnings (USD)': 'earnings'}
+            ).round({'earnings': 2}).to_dict('records')
+
+            # Per-country breakdown for this song (top 15)
+            ctry_detail = song_streaming.groupby('Country of Sale').agg({
+                'Quantity': 'sum', 'gross_earnings': 'sum', 'Earnings (USD)': 'sum'
+            }).reset_index()
+            ctry_detail = ctry_detail[ctry_detail['Quantity'] >= 100]
+            ctry_detail['per_stream'] = (ctry_detail['gross_earnings'] / ctry_detail['Quantity']).round(4)
+            ctry_detail['pct_of_streams'] = (ctry_detail['Quantity'] / song_streams * 100).round(1) if song_streams > 0 else 0
+            ctry_detail = ctry_detail.sort_values('Quantity', ascending=False).head(15)
+            entry['by_country'] = ctry_detail[['Country of Sale', 'Quantity', 'Earnings (USD)', 'per_stream', 'pct_of_streams']].rename(
+                columns={'Country of Sale': 'country', 'Quantity': 'streams', 'Earnings (USD)': 'earnings'}
+            ).round({'earnings': 2}).to_dict('records')
+
             # Release type info
             if self._has_upc and 'release_type' in self.df.columns:
                 song_row = self.df[self.df['Title'] == song]
@@ -209,6 +264,8 @@ class InsightsEngine:
         matrix['per_stream'] = (matrix['gross_earnings'] / matrix['Quantity']).round(4)
         matrix = matrix.drop(columns=['gross_earnings'])
         matrix.columns = ['platform', 'country', 'streams', 'earnings', 'per_stream']
+        # Filter out noise: minimum earnings and per_stream thresholds
+        matrix = matrix[(matrix['earnings'] >= MIN_EARNINGS_FOR_MATRIX) & (matrix['per_stream'] >= MIN_PER_STREAM_FOR_MATRIX)]
         matrix['earnings'] = matrix['earnings'].round(2)
         matrix = matrix.sort_values('per_stream', ascending=False)
 
@@ -270,12 +327,7 @@ class InsightsEngine:
             if len(valid) < 5:
                 continue
             r, p = stats.pearsonr(valid[col_a], valid[col_b])
-            correlations.append({
-                "pair": label,
-                "r": round(float(r), 3),
-                "p_value": round(float(p), 4),
-                "significant": bool(p < 0.05),
-            })
+            correlations.append(self._interpret_correlation(label, float(r), float(p)))
 
         # Release type correlations (if UPC available)
         if self._has_upc and 'release_type' in self.df.columns:
@@ -293,21 +345,11 @@ class InsightsEngine:
                 valid_ps = valid_rt.dropna(subset=['per_stream'])
                 if len(valid_ps) >= 5:
                     r, p = stats.pearsonr(valid_ps['release_type_num'], valid_ps['per_stream'])
-                    correlations.append({
-                        "pair": "Release type vs per-stream rate",
-                        "r": round(float(r), 3),
-                        "p_value": round(float(p), 4),
-                        "significant": bool(p < 0.05),
-                    })
+                    correlations.append(self._interpret_correlation("Release type vs per-stream rate", float(r), float(p)))
 
                 # release_type vs earnings
                 r, p = stats.pearsonr(valid_rt['release_type_num'], valid_rt['earnings'])
-                correlations.append({
-                    "pair": "Release type vs earnings",
-                    "r": round(float(r), 3),
-                    "p_value": round(float(p), 4),
-                    "significant": bool(p < 0.05),
-                })
+                correlations.append(self._interpret_correlation("Release type vs earnings", float(r), float(p)))
 
             # Track count vs per_stream
             if 'track_count' in self.df.columns:
@@ -316,12 +358,7 @@ class InsightsEngine:
                 valid_tc = sf_tc.dropna(subset=['track_count', 'per_stream'])
                 if len(valid_tc) >= 5:
                     r, p = stats.pearsonr(valid_tc['track_count'], valid_tc['per_stream'])
-                    correlations.append({
-                        "pair": "Track count vs per-stream rate",
-                        "r": round(float(r), 3),
-                        "p_value": round(float(p), 4),
-                        "significant": bool(p < 0.05),
-                    })
+                    correlations.append(self._interpret_correlation("Track count vs per-stream rate", float(r), float(p)))
 
             # ANOVA across release type groups for per_stream
             groups = []
@@ -331,11 +368,13 @@ class InsightsEngine:
                     groups.append(grp)
             if len(groups) >= 2:
                 f_stat, p_val = stats.f_oneway(*groups)
+                p_safe = float(p_val) if not np.isnan(p_val) else 1.0
                 correlations.append({
                     "pair": "ANOVA: release type groups vs per-stream",
-                    "f_statistic": round(float(f_stat), 3) if not np.isnan(f_stat) else None,
-                    "p_value": round(float(p_val), 4) if not np.isnan(p_val) else None,
-                    "significant": bool(p_val < 0.05) if not np.isnan(p_val) else False,
+                    "finding": "Per-stream rates differ significantly across release types" if p_safe < 0.05
+                               else "Per-stream rates are similar across release types",
+                    "confidence": "high" if p_safe < 0.01 else ("medium" if p_safe < 0.05 else "low"),
+                    "actionable": bool(p_safe < 0.05),
                 })
 
         return {"available": True, "correlations": correlations}
@@ -357,9 +396,17 @@ class InsightsEngine:
             std_change = monthly['mom_change'].std()
             if std_change and std_change > 0:
                 monthly['z_score'] = ((monthly['mom_change'] - mean_change) / std_change)
-                spikes = monthly[monthly['z_score'].abs() > 2.0].copy()
+                spikes = monthly[(monthly['z_score'].abs() > 2.0) & (monthly['earnings'] >= MIN_EARNINGS_FOR_ANOMALY)].copy()
                 spikes['month'] = spikes['month'].astype(str)
-                anomalies['monthly_earnings'] = spikes[['month', 'earnings', 'mom_change', 'z_score']].round(2).to_dict('records')
+                spikes['severity'] = spikes['z_score'].abs().apply(
+                    lambda z: 'high' if z > 3.0 else ('medium' if z > 2.5 else 'low')
+                )
+                spikes['description'] = spikes.apply(
+                    lambda row: f"{'Spike' if row['mom_change'] > 0 else 'Drop'} of ${abs(row['mom_change']):.0f} in {row['month']}"
+                    f" ({'+' if row['mom_change'] > 0 else ''}{row['mom_change']:.0f} vs prior month)",
+                    axis=1
+                )
+                anomalies['monthly_earnings'] = spikes[['month', 'earnings', 'mom_change', 'severity', 'description']].round(2).to_dict('records')
             else:
                 anomalies['monthly_earnings'] = []
         else:
@@ -375,13 +422,22 @@ class InsightsEngine:
         song_monthly['change_pct'] = ((song_monthly['earnings'] / song_monthly['prev']) - 1) * 100
 
         song_spikes = song_monthly[
-            (song_monthly['change_pct'] > 200) | (song_monthly['change_pct'] < -60)
+            ((song_monthly['change_pct'] > 200) | (song_monthly['change_pct'] < -60))
+            & (song_monthly['earnings'] >= MIN_EARNINGS_FOR_SONG_ANOMALY)
         ].copy()
         song_spikes = song_spikes.dropna(subset=['change_pct'])
         song_spikes['month'] = song_spikes['month'].astype(str)
         # Limit to top 20 most extreme
         song_spikes = song_spikes.reindex(song_spikes['change_pct'].abs().sort_values(ascending=False).index).head(20)
-        anomalies['song_spikes'] = song_spikes[['month', 'title', 'earnings', 'change_pct']].round(2).to_dict('records')
+        song_spikes['severity'] = song_spikes['change_pct'].abs().apply(
+            lambda p: 'high' if p > 500 else ('medium' if p > 200 else 'low')
+        )
+        song_spikes['description'] = song_spikes.apply(
+            lambda row: f"{row['title']}: {'surged' if row['change_pct'] > 0 else 'dropped'} "
+            f"{abs(row['change_pct']):.0f}% in {row['month']}",
+            axis=1
+        )
+        anomalies['song_spikes'] = song_spikes[['month', 'title', 'earnings', 'change_pct', 'severity', 'description']].round(2).to_dict('records')
 
         # Geographic spikes (country jumping >3 std devs above its mean for a song)
         geo = self.df.groupby(['Title', 'Country of Sale']).agg({
@@ -394,8 +450,16 @@ class InsightsEngine:
         song_stats.columns = ['title', 'country_mean', 'country_std']
         geo = geo.merge(song_stats, on='title')
         geo['z'] = np.where(geo['country_std'] > 0, (geo['earnings'] - geo['country_mean']) / geo['country_std'], 0)
-        geo_spikes = geo[geo['z'] > 3.0].sort_values('z', ascending=False).head(15)
-        anomalies['geographic_spikes'] = geo_spikes[['title', 'country', 'earnings', 'z']].round(2).to_dict('records')
+        geo_spikes = geo[(geo['z'] > 3.0) & (geo['earnings'] >= MIN_EARNINGS_FOR_SONG_ANOMALY)].sort_values('z', ascending=False).head(15).copy()
+        geo_spikes['severity'] = geo_spikes['z'].apply(
+            lambda z: 'high' if z > 5.0 else ('medium' if z > 4.0 else 'low')
+        )
+        geo_spikes['description'] = geo_spikes.apply(
+            lambda row: f"{row['title']} earned ${row['earnings']:.0f} in {row['country']}, "
+            f"far above this song's country average",
+            axis=1
+        )
+        anomalies['geographic_spikes'] = geo_spikes[['title', 'country', 'earnings', 'severity', 'description']].round(2).to_dict('records')
 
         # Release-type anomalies: $/stream deviation from own historical trend
         if self._has_upc and 'release_type' in self.streaming_df.columns:
@@ -410,8 +474,16 @@ class InsightsEngine:
             rtq['rate_change_pct'] = ((rtq['per_stream'] / rtq['prev_rate']) - 1) * 100
             rt_anomalies = rtq[rtq['rate_change_pct'].abs() > 15].dropna(subset=['rate_change_pct']).copy()
             rt_anomalies['quarter'] = rt_anomalies['quarter'].astype(str)
+            rt_anomalies['severity'] = rt_anomalies['rate_change_pct'].abs().apply(
+                lambda p: 'high' if p > 30 else ('medium' if p > 20 else 'low')
+            )
+            rt_anomalies['description'] = rt_anomalies.apply(
+                lambda row: f"{row['release_type']} $/stream {'rose' if row['rate_change_pct'] > 0 else 'fell'} "
+                f"{abs(row['rate_change_pct']):.0f}% in {row['quarter']}",
+                axis=1
+            )
             anomalies['release_type_rate_shifts'] = rt_anomalies[
-                ['release_type', 'quarter', 'per_stream', 'rate_change_pct']
+                ['release_type', 'quarter', 'per_stream', 'rate_change_pct', 'severity', 'description']
             ].round(4).to_dict('records')
         else:
             anomalies['release_type_rate_shifts'] = []
@@ -647,76 +719,15 @@ class InsightsEngine:
         return {"available": True, "segments": segments}
 
     def get_release_strategy_insights(self) -> Dict[str, Any]:
-        """Release pattern analysis: effectiveness by type, cannibalization, variant performance."""
+        """Release pattern analysis: variant performance and release type trend.
+
+        Note: type_effectiveness and cannibalization are served by
+        analytics_engine.get_release_strategy_analysis() to avoid duplication.
+        """
         if not self._has_upc:
             return {"available": False, "reason": "Requires UPC data"}
 
-        sdf = self.streaming_df
         result: Dict[str, Any] = {"available": True}
-
-        # Release type effectiveness
-        rt_eff = []
-        for rtype in ['Single', 'EP', 'Album']:
-            rt_data = self.df[self.df['release_type'] == rtype]
-            if rt_data.empty:
-                continue
-            rt_streaming = sdf[sdf['release_type'] == rtype] if 'release_type' in sdf.columns else pd.DataFrame()
-
-            n_releases = rt_data['UPC'].nunique()
-            total_earnings = rt_data['Earnings (USD)'].sum()
-            avg_earnings = total_earnings / n_releases if n_releases > 0 else 0
-
-            str_streams = rt_streaming['Quantity'].sum() if not rt_streaming.empty else 0
-            str_gross = rt_streaming['gross_earnings'].sum() if not rt_streaming.empty else 0
-            avg_per_stream = str_gross / str_streams if str_streams > 0 else 0
-
-            # Avg longevity: unique months per release
-            longevity = rt_data.groupby('UPC')['Sale Month'].nunique().mean()
-
-            rt_eff.append({
-                "release_type": rtype,
-                "release_count": int(n_releases),
-                "total_earnings": round(float(total_earnings), 2),
-                "avg_earnings_per_release": round(float(avg_earnings), 2),
-                "avg_per_stream": round(float(avg_per_stream), 4),
-                "avg_longevity_months": round(float(longevity), 1),
-            })
-
-        result['type_effectiveness'] = rt_eff
-
-        # Cross-released songs: cannibalization analysis
-        title_releases = self.df.groupby('Title')['UPC'].nunique()
-        cross_titles = title_releases[title_releases > 1].index
-
-        cannibalization = []
-        for title in cross_titles:
-            title_df = self.df[self.df['Title'] == title]
-            by_release = title_df.groupby(['UPC', 'release_type']).agg({
-                'Quantity': 'sum', 'Earnings (USD)': 'sum'
-            }).reset_index()
-
-            total_streams = by_release['Quantity'].sum()
-            if total_streams == 0:
-                continue
-
-            splits = []
-            for _, row in by_release.iterrows():
-                splits.append({
-                    "release_type": row['release_type'],
-                    "streams": int(row['Quantity']),
-                    "earnings": round(float(row['Earnings (USD)']), 2),
-                    "stream_share_pct": round(float(row['Quantity'] / total_streams * 100), 1),
-                })
-
-            cannibalization.append({
-                "title": title,
-                "total_streams": int(total_streams),
-                "total_earnings": round(float(by_release['Earnings (USD)'].sum()), 2),
-                "splits": splits,
-            })
-
-        cannibalization.sort(key=lambda x: x['total_earnings'], reverse=True)
-        result['cannibalization'] = cannibalization[:20]
 
         # Variant performance: remasters, remixes, acoustic, slowed
         variant_keywords = ['remix', 'remaster', 'acoustic', 'slowed', 'sped up', 'live', 'instrumental']
@@ -800,6 +811,36 @@ class InsightsEngine:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _interpret_correlation(label: str, r: float, p: float) -> Dict[str, Any]:
+        """Convert a statistical correlation into plain English output."""
+        strength = abs(r)
+        direction = "positive" if r > 0 else "negative"
+
+        if strength > 0.7:
+            strength_word = "Strong"
+        elif strength > 0.4:
+            strength_word = "Moderate"
+        elif strength > 0.2:
+            strength_word = "Weak"
+        else:
+            strength_word = "Negligible"
+
+        confidence = "high" if p < 0.01 else ("medium" if p < 0.05 else "low")
+        actionable = strength > 0.3 and p < 0.05
+
+        if strength_word == "Negligible":
+            finding = f"No meaningful relationship found between {label.lower()}"
+        else:
+            finding = f"{strength_word} {direction} relationship between {label.lower()}"
+
+        return {
+            "pair": label,
+            "finding": finding,
+            "confidence": confidence,
+            "actionable": actionable,
+        }
 
     @staticmethod
     def _label_clusters(centroids: pd.DataFrame) -> Dict[int, str]:
