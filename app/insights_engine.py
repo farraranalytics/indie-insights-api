@@ -46,57 +46,63 @@ class InsightsEngine:
             return {"available": False, "reason": "No streaming data available"}
 
         total_streams = sdf['Quantity'].sum()
-        total_earnings = sdf['Earnings (USD)'].sum()
-        catalog_avg = round(float(total_earnings / total_streams), 4) if total_streams > 0 else 0
+        total_gross = sdf['gross_earnings'].sum()
+        catalog_avg = round(float(total_gross / total_streams), 4) if total_streams > 0 else 0
 
         result: Dict[str, Any] = {"available": True, "catalog_avg_per_stream": catalog_avg}
 
         # By platform (top 10 by volume, min threshold)
-        plat = sdf.groupby('Store').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
+        plat = sdf.groupby('Store').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
         plat = plat[plat['Quantity'] >= MIN_STREAMS_FOR_RATE]
-        plat['per_stream'] = (plat['Earnings (USD)'] / plat['Quantity']).round(4)
+        plat['per_stream'] = (plat['gross_earnings'] / plat['Quantity']).round(4)
         plat = plat.sort_values('Quantity', ascending=False).head(10)
+        plat = plat.drop(columns=['gross_earnings'])
         plat.columns = ['platform', 'streams', 'earnings', 'per_stream']
         result['by_platform'] = plat.to_dict('records')
 
         # By country (top 15 by volume, min threshold)
-        ctry = sdf.groupby('Country of Sale').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
+        ctry = sdf.groupby('Country of Sale').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
         ctry = ctry[ctry['Quantity'] >= MIN_STREAMS_FOR_RATE]
-        ctry['per_stream'] = (ctry['Earnings (USD)'] / ctry['Quantity']).round(4)
+        ctry['per_stream'] = (ctry['gross_earnings'] / ctry['Quantity']).round(4)
         ctry = ctry.sort_values('Quantity', ascending=False).head(15)
+        ctry = ctry.drop(columns=['gross_earnings'])
         ctry.columns = ['country', 'streams', 'earnings', 'per_stream']
         result['by_country'] = ctry.to_dict('records')
 
         # By release type
         if self._has_upc and 'release_type' in sdf.columns:
-            rt = sdf.groupby('release_type').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
-            rt['per_stream'] = (rt['Earnings (USD)'] / rt['Quantity']).round(4)
+            rt = sdf.groupby('release_type').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
+            rt['per_stream'] = (rt['gross_earnings'] / rt['Quantity']).round(4)
+            rt = rt.drop(columns=['gross_earnings'])
             rt.columns = ['release_type', 'streams', 'earnings', 'per_stream']
             rt = rt.sort_values('earnings', ascending=False)
             result['by_release_type'] = rt.to_dict('records')
 
         # By release name
         if self._has_upc and 'release_name' in sdf.columns:
-            rn = sdf.groupby('release_name').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
+            rn = sdf.groupby('release_name').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
             rn = rn[rn['Quantity'] >= MIN_STREAMS_FOR_RATE]
-            rn['per_stream'] = (rn['Earnings (USD)'] / rn['Quantity']).round(4)
+            rn['per_stream'] = (rn['gross_earnings'] / rn['Quantity']).round(4)
+            rn = rn.drop(columns=['gross_earnings'])
             rn.columns = ['release_name', 'streams', 'earnings', 'per_stream']
             rn = rn.sort_values('earnings', ascending=False)
             result['by_release_name'] = rn.to_dict('records')
 
         # By quarter
-        qtr = sdf.groupby('Quarter').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
+        qtr = sdf.groupby('Quarter').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
         qtr = qtr[qtr['Quantity'] >= MIN_STREAMS_FOR_RATE]
-        qtr['per_stream'] = (qtr['Earnings (USD)'] / qtr['Quantity']).round(4)
+        qtr['per_stream'] = (qtr['gross_earnings'] / qtr['Quantity']).round(4)
+        qtr = qtr.drop(columns=['gross_earnings'])
         qtr.columns = ['quarter', 'streams', 'earnings', 'per_stream']
         qtr = qtr.sort_values('quarter')
         result['by_quarter'] = qtr.to_dict('records')
 
         # Release type x quarter
         if self._has_upc and 'release_type' in sdf.columns:
-            rtq = sdf.groupby(['release_type', 'Quarter']).agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
+            rtq = sdf.groupby(['release_type', 'Quarter']).agg({'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'}).reset_index()
             rtq = rtq[rtq['Quantity'] >= MIN_STREAMS_FOR_RATE]
-            rtq['per_stream'] = (rtq['Earnings (USD)'] / rtq['Quantity']).round(4)
+            rtq['per_stream'] = (rtq['gross_earnings'] / rtq['Quantity']).round(4)
+            rtq = rtq.drop(columns=['gross_earnings'])
             rtq.columns = ['release_type', 'quarter', 'streams', 'earnings', 'per_stream']
             rtq = rtq.sort_values(['release_type', 'quarter'])
             result['by_release_type_quarter'] = rtq.to_dict('records')
@@ -110,8 +116,8 @@ class InsightsEngine:
             return {"available": False, "reason": "No streaming data available"}
 
         total_streams = sdf['Quantity'].sum()
-        total_earnings = sdf['Earnings (USD)'].sum()
-        catalog_avg = total_earnings / total_streams if total_streams > 0 else 0
+        total_gross = sdf['gross_earnings'].sum()
+        catalog_avg = total_gross / total_streams if total_streams > 0 else 0
 
         # Top songs by total earnings (full df)
         top_songs = self.df.groupby('Title')['Earnings (USD)'].sum().sort_values(ascending=False).head(top_n).index
@@ -120,8 +126,8 @@ class InsightsEngine:
         for song in top_songs:
             song_streaming = sdf[sdf['Title'] == song]
             song_streams = song_streaming['Quantity'].sum()
-            song_earnings = song_streaming['Earnings (USD)'].sum()
-            song_rate = song_earnings / song_streams if song_streams > 0 else 0
+            song_gross = song_streaming['gross_earnings'].sum()
+            song_rate = song_gross / song_streams if song_streams > 0 else 0
 
             pct_diff = ((song_rate - catalog_avg) / catalog_avg * 100) if catalog_avg > 0 else 0
 
@@ -153,7 +159,7 @@ class InsightsEngine:
                 "catalog_avg": round(float(catalog_avg), 4),
                 "pct_diff_from_catalog": round(float(pct_diff), 1),
                 "streams": int(song_streams),
-                "streaming_earnings": round(float(song_earnings), 2),
+                "streaming_earnings": round(float(song_streaming['Earnings (USD)'].sum()), 2),
                 "primary_platform": primary_platform,
                 "primary_platform_share_pct": primary_platform_share,
                 "primary_country": primary_country,
@@ -170,11 +176,11 @@ class InsightsEngine:
                     entry['release_type'] = rtype
                     entry['release_name'] = rname
 
-                    # Release type avg rate
+                    # Release type avg rate (gross for true rate)
                     rt_data = sdf[sdf['release_type'] == rtype]
                     rt_streams = rt_data['Quantity'].sum()
-                    rt_earnings = rt_data['Earnings (USD)'].sum()
-                    rt_avg = rt_earnings / rt_streams if rt_streams > 0 else 0
+                    rt_gross = rt_data['gross_earnings'].sum()
+                    rt_avg = rt_gross / rt_streams if rt_streams > 0 else 0
                     entry['release_type_avg_per_stream'] = round(float(rt_avg), 4)
 
             drivers.append(entry)
@@ -193,14 +199,15 @@ class InsightsEngine:
 
         filtered = sdf[sdf['Store'].isin(top_plats) & sdf['Country of Sale'].isin(top_ctries)]
         matrix = filtered.groupby(['Store', 'Country of Sale']).agg({
-            'Quantity': 'sum', 'Earnings (USD)': 'sum'
+            'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'
         }).reset_index()
         matrix = matrix[matrix['Quantity'] >= MIN_STREAMS_FOR_RATE]
 
         if matrix.empty:
             return {"available": False, "reason": "Insufficient data for platform-country matrix"}
 
-        matrix['per_stream'] = (matrix['Earnings (USD)'] / matrix['Quantity']).round(4)
+        matrix['per_stream'] = (matrix['gross_earnings'] / matrix['Quantity']).round(4)
+        matrix = matrix.drop(columns=['gross_earnings'])
         matrix.columns = ['platform', 'country', 'streams', 'earnings', 'per_stream']
         matrix['earnings'] = matrix['earnings'].round(2)
         matrix = matrix.sort_values('per_stream', ascending=False)
@@ -238,10 +245,10 @@ class InsightsEngine:
         }).reset_index()
         song_features.columns = ['title', 'earnings', 'total_qty', 'platform_count', 'country_count', 'month_count']
 
-        # Streaming per_stream per song
-        str_song = sdf.groupby('Title').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
-        str_song.columns = ['title', 'streaming_streams', 'streaming_earnings']
-        str_song['per_stream'] = str_song['streaming_earnings'] / str_song['streaming_streams']
+        # Streaming per_stream per song (gross for true rate)
+        str_song = sdf.groupby('Title').agg({'Quantity': 'sum', 'gross_earnings': 'sum'}).reset_index()
+        str_song.columns = ['title', 'streaming_streams', 'streaming_gross']
+        str_song['per_stream'] = str_song['streaming_gross'] / str_song['streaming_streams']
         str_song['per_stream'] = str_song['per_stream'].replace([np.inf, -np.inf], np.nan)
 
         song_features = song_features.merge(str_song[['title', 'per_stream']], on='title', how='left')
@@ -394,10 +401,10 @@ class InsightsEngine:
         if self._has_upc and 'release_type' in self.streaming_df.columns:
             sdf = self.streaming_df
             rtq = sdf.groupby(['release_type', sdf['Sale Month'].dt.to_period('Q')]).agg({
-                'Quantity': 'sum', 'Earnings (USD)': 'sum'
+                'Quantity': 'sum', 'gross_earnings': 'sum'
             }).reset_index()
-            rtq.columns = ['release_type', 'quarter', 'streams', 'earnings']
-            rtq['per_stream'] = rtq['earnings'] / rtq['streams']
+            rtq.columns = ['release_type', 'quarter', 'streams', 'gross']
+            rtq['per_stream'] = rtq['gross'] / rtq['streams']
             rtq = rtq.sort_values(['release_type', 'quarter'])
             rtq['prev_rate'] = rtq.groupby('release_type')['per_stream'].shift(1)
             rtq['rate_change_pct'] = ((rtq['per_stream'] / rtq['prev_rate']) - 1) * 100
@@ -551,10 +558,10 @@ class InsightsEngine:
         }).reset_index()
         song_full.columns = ['title', 'total_earnings', 'total_qty', 'platform_count', 'country_count']
 
-        # Streaming metrics
-        str_song = sdf.groupby('Title').agg({'Quantity': 'sum', 'Earnings (USD)': 'sum'}).reset_index()
-        str_song.columns = ['title', 'total_streams', 'streaming_earnings']
-        str_song['per_stream'] = (str_song['streaming_earnings'] / str_song['total_streams']).replace([np.inf, -np.inf], 0).fillna(0)
+        # Streaming metrics (gross for true $/stream rate)
+        str_song = sdf.groupby('Title').agg({'Quantity': 'sum', 'gross_earnings': 'sum'}).reset_index()
+        str_song.columns = ['title', 'total_streams', 'streaming_gross']
+        str_song['per_stream'] = (str_song['streaming_gross'] / str_song['total_streams']).replace([np.inf, -np.inf], 0).fillna(0)
 
         song_full = song_full.merge(str_song[['title', 'total_streams', 'per_stream']], on='title', how='left')
         song_full['total_streams'] = song_full['total_streams'].fillna(0)
@@ -660,8 +667,8 @@ class InsightsEngine:
             avg_earnings = total_earnings / n_releases if n_releases > 0 else 0
 
             str_streams = rt_streaming['Quantity'].sum() if not rt_streaming.empty else 0
-            str_earnings = rt_streaming['Earnings (USD)'].sum() if not rt_streaming.empty else 0
-            avg_per_stream = str_earnings / str_streams if str_streams > 0 else 0
+            str_gross = rt_streaming['gross_earnings'].sum() if not rt_streaming.empty else 0
+            avg_per_stream = str_gross / str_streams if str_streams > 0 else 0
 
             # Avg longevity: unique months per release
             longevity = rt_data.groupby('UPC')['Sale Month'].nunique().mean()

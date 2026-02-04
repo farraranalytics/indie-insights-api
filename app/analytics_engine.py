@@ -234,10 +234,10 @@ class DistroKidAnalyzer:
         # Compute per_stream from streaming data only
         streaming_by_type = self._streaming_df.groupby('release_type').agg({
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
         }).reset_index()
-        streaming_by_type.columns = ['release_type', 'str_streams', 'str_earnings']
-        streaming_by_type['per_stream'] = (streaming_by_type['str_earnings'] / streaming_by_type['str_streams']).round(4)
+        streaming_by_type.columns = ['release_type', 'str_streams', 'str_gross']
+        streaming_by_type['per_stream'] = (streaming_by_type['str_gross'] / streaming_by_type['str_streams']).round(4)
 
         summary = summary.merge(streaming_by_type[['release_type', 'per_stream']], on='release_type', how='left')
         summary = summary.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -286,7 +286,7 @@ class DistroKidAnalyzer:
             "unique_songs": int(self.df['Title'].nunique()),
             "unique_platforms": int(self.df['Store'].nunique()),
             "unique_countries": int(self.df['Country of Sale'].nunique()),
-            "avg_per_stream": round(streaming_earnings / streaming_streams, 4) if streaming_streams > 0 else 0,
+            "avg_per_stream": round(float(self._streaming_df['gross_earnings'].sum()) / streaming_streams, 4) if streaming_streams > 0 else 0,
             "streaming_earnings": round(streaming_earnings, 2),
             "download_earnings": round(download_earnings, 2),
             "download_units": download_units,
@@ -341,13 +341,13 @@ class DistroKidAnalyzer:
         }).reset_index()
         songs.columns = ['title', 'streams', 'earnings']
 
-        # Compute per_stream from streaming data only
+        # Compute per_stream from streaming data only (using gross earnings for true platform rate)
         streaming_songs = self._streaming_df.groupby('Title').agg({
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum'
+            'gross_earnings': 'sum'
         }).reset_index()
-        streaming_songs.columns = ['title', 'streaming_streams', 'streaming_earnings']
-        streaming_songs['per_stream'] = (streaming_songs['streaming_earnings'] / streaming_songs['streaming_streams']).round(4)
+        streaming_songs.columns = ['title', 'streaming_streams', 'streaming_gross']
+        streaming_songs['per_stream'] = (streaming_songs['streaming_gross'] / streaming_songs['streaming_streams']).round(4)
 
         songs = songs.merge(streaming_songs[['title', 'per_stream']], on='title', how='left')
         songs['per_stream'] = songs['per_stream'].fillna(0)
@@ -369,11 +369,16 @@ class DistroKidAnalyzer:
         platforms.columns = ['platform', 'streams', 'earnings']
         platforms['is_streaming'] = ~platforms['platform'].isin(self._non_streaming)
         streaming_mask = platforms['is_streaming']
+        # Compute gross earnings per platform for true $/stream
+        gross_by_plat = self.df.groupby('Store')['gross_earnings'].sum().reset_index()
+        gross_by_plat.columns = ['platform', 'gross_earn']
+        platforms = platforms.merge(gross_by_plat, on='platform', how='left')
         platforms['per_stream'] = None
         if streaming_mask.any():
             platforms.loc[streaming_mask, 'per_stream'] = (
-                platforms.loc[streaming_mask, 'earnings'] / platforms.loc[streaming_mask, 'streams']
+                platforms.loc[streaming_mask, 'gross_earn'] / platforms.loc[streaming_mask, 'streams']
             ).round(4)
+        platforms = platforms.drop(columns=['gross_earn'])
         platforms['pct_of_total'] = (platforms['earnings'] / total_earnings * 100).round(1)
         platforms['earnings'] = platforms['earnings'].round(2)
         platforms = platforms.sort_values('earnings', ascending=False)
@@ -390,13 +395,13 @@ class DistroKidAnalyzer:
         }).reset_index()
         countries.columns = ['country', 'streams', 'earnings']
 
-        # Compute per_stream from streaming data only
+        # Compute per_stream from streaming data only (using gross earnings for true platform rate)
         streaming_countries = self._streaming_df.groupby('Country of Sale').agg({
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum'
+            'gross_earnings': 'sum'
         }).reset_index()
-        streaming_countries.columns = ['country', 'streaming_streams', 'streaming_earnings']
-        streaming_countries['per_stream'] = (streaming_countries['streaming_earnings'] / streaming_countries['streaming_streams']).round(4)
+        streaming_countries.columns = ['country', 'streaming_streams', 'streaming_gross']
+        streaming_countries['per_stream'] = (streaming_countries['streaming_gross'] / streaming_countries['streaming_streams']).round(4)
 
         countries = countries.merge(streaming_countries[['country', 'per_stream']], on='country', how='left')
         countries['per_stream'] = countries['per_stream'].fillna(0)
@@ -494,9 +499,11 @@ class DistroKidAnalyzer:
                 'Earnings (USD)': 'sum'
             })
             is_streaming = ~platforms.index.isin(self._non_streaming)
+            # Use gross_earnings for true $/stream rate
+            gross_by_store = song_df.groupby('Store')['gross_earnings'].sum()
             platforms['per_stream'] = np.where(
                 is_streaming,
-                (platforms['Earnings (USD)'] / platforms['Quantity']).round(4),
+                (gross_by_store / platforms['Quantity']).round(4),
                 np.nan
             )
             platforms['pct'] = platforms['Earnings (USD)'] / platforms['Earnings (USD)'].sum() * 100
@@ -521,9 +528,10 @@ class DistroKidAnalyzer:
         """Identify high-value vs high-volume markets (streaming only)"""
         countries = self._streaming_df.groupby('Country of Sale').agg({
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum'
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum'
         })
-        countries['per_stream'] = countries['Earnings (USD)'] / countries['Quantity']
+        countries['per_stream'] = countries['gross_earnings'] / countries['Quantity']
 
         # High value = high $/stream, decent volume
         high_value = countries[countries['Quantity'] > 10000].sort_values('per_stream', ascending=False).head(5)
@@ -569,13 +577,13 @@ class DistroKidAnalyzer:
         }).reset_index()
         songs.columns = ['title', 'streams', 'earnings']
 
-        # per_stream from streaming data only
+        # per_stream from streaming data only (using gross for true rate)
         streaming_songs = streaming_filtered.groupby('Title').agg({
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum'
+            'gross_earnings': 'sum'
         }).reset_index()
-        streaming_songs.columns = ['title', 'str_streams', 'str_earnings']
-        streaming_songs['per_stream'] = (streaming_songs['str_earnings'] / streaming_songs['str_streams']).round(4)
+        streaming_songs.columns = ['title', 'str_streams', 'str_gross']
+        streaming_songs['per_stream'] = (streaming_songs['str_gross'] / streaming_songs['str_streams']).round(4)
 
         songs = songs.merge(streaming_songs[['title', 'per_stream']], on='title', how='left')
         songs['per_stream'] = songs['per_stream'].fillna(0)
@@ -691,7 +699,8 @@ class DistroKidAnalyzer:
                 continue
             streams = int(rt_data['Quantity'].sum())
             earnings = float(rt_data['Earnings (USD)'].sum())
-            per_stream = round(earnings / streams, 4) if streams > 0 else 0
+            gross = float(rt_data['gross_earnings'].sum())
+            per_stream = round(gross / streams, 4) if streams > 0 else 0
             pct = round(earnings / total_earnings * 100, 1) if total_earnings > 0 else 0
             type_perf[rtype.lower() + 's'] = {
                 "count": int(rt_data['UPC'].nunique()),
@@ -733,6 +742,7 @@ class DistroKidAnalyzer:
                 by_type = song_data.groupby('release_type').agg({
                     'Quantity': 'sum',
                     'Earnings (USD)': 'sum',
+                    'gross_earnings': 'sum',
                 }).reset_index()
 
                 total_s = int(by_type['Quantity'].sum())
@@ -743,8 +753,10 @@ class DistroKidAnalyzer:
                 album_row = by_type[by_type['release_type'].isin(['Album', 'EP'])]
 
                 single_streams = int(single_row['Quantity'].sum()) if not single_row.empty else 0
+                single_gross = float(single_row['gross_earnings'].sum()) if not single_row.empty else 0
                 single_earnings = float(single_row['Earnings (USD)'].sum()) if not single_row.empty else 0
                 album_streams = int(album_row['Quantity'].sum()) if not album_row.empty else 0
+                album_gross = float(album_row['gross_earnings'].sum()) if not album_row.empty else 0
                 album_earnings = float(album_row['Earnings (USD)'].sum()) if not album_row.empty else 0
 
                 single_capture = round(single_streams / total_s * 100, 0) if total_s > 0 else 0
@@ -753,10 +765,10 @@ class DistroKidAnalyzer:
                     "title": title,
                     "single_streams": single_streams,
                     "single_earnings": round(single_earnings, 2),
-                    "single_per_stream": round(single_earnings / single_streams, 4) if single_streams > 0 else 0,
+                    "single_per_stream": round(single_gross / single_streams, 4) if single_streams > 0 else 0,
                     "album_streams": album_streams,
                     "album_earnings": round(album_earnings, 2),
-                    "album_per_stream": round(album_earnings / album_streams, 4) if album_streams > 0 else 0,
+                    "album_per_stream": round(album_gross / album_streams, 4) if album_streams > 0 else 0,
                     "single_capture_pct": single_capture,
                 }
 
@@ -798,7 +810,7 @@ class DistroKidAnalyzer:
                 if rt_data.empty:
                     continue
                 plat_agg = rt_data.groupby('Store').agg({
-                    'Quantity': 'sum', 'Earnings (USD)': 'sum'
+                    'Quantity': 'sum', 'Earnings (USD)': 'sum', 'gross_earnings': 'sum'
                 }).reset_index()
                 plat_agg = plat_agg[plat_agg['Quantity'] >= 1000]
                 if plat_agg.empty:
@@ -810,7 +822,7 @@ class DistroKidAnalyzer:
                 plat_by_type.append({
                     "release_type": rtype,
                     "top_platform": top_plat['Store'],
-                    "per_stream": round(float(top_plat['Earnings (USD)'] / top_plat['Quantity']), 4) if top_plat['Quantity'] > 0 else 0,
+                    "per_stream": round(float(top_plat['gross_earnings'] / top_plat['Quantity']), 4) if top_plat['Quantity'] > 0 else 0,
                     "pct_of_type_earnings": round(float(top_plat['Earnings (USD)'] / rt_total * 100), 1) if rt_total > 0 else 0,
                 })
 
