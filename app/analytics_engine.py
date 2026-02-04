@@ -645,320 +645,259 @@ class DistroKidAnalyzer:
         return breakdown.to_dict('records')
     
     # ------------------------------------------------------------------
-    # Deal Intelligence — ownership, splits & deal performance
+    # Ownership & Release Strategy Analysis
     # ------------------------------------------------------------------
 
     def get_ownership_summary(self) -> Dict[str, Any]:
-        """High-level ownership breakdown: full vs partial, gross vs net."""
+        """Simple ownership breakdown: full vs partial, gross vs net."""
         if not self._has_team_pct:
             return {"available": False, "reason": "No Team Percentage column in data"}
 
         full_mask = self.df['team_percentage'] >= 100
         partial_mask = ~full_mask
 
-        full_songs = int(self.df.loc[full_mask, 'Title'].nunique())
-        partial_songs = int(self.df.loc[partial_mask, 'Title'].nunique())
-
         your_total = float(self.df['Earnings (USD)'].sum())
         gross_total = float(self.df['gross_earnings'].sum())
-        partner_share = gross_total - your_total
-
-        full_earnings = float(self.df.loc[full_mask, 'Earnings (USD)'].sum())
-        partial_earnings = float(self.df.loc[partial_mask, 'Earnings (USD)'].sum())
-
-        effective_ownership = (your_total / gross_total * 100) if gross_total > 0 else 100.0
 
         return {
             "available": True,
-            "full_ownership_songs": full_songs,
-            "partial_ownership_songs": partial_songs,
-            "full_ownership_earnings": round(full_earnings, 2),
-            "partial_ownership_earnings": round(partial_earnings, 2),
+            "full_ownership_songs": int(self.df.loc[full_mask, 'Title'].nunique()),
+            "partial_ownership_songs": int(self.df.loc[partial_mask, 'Title'].nunique()),
+            "full_ownership_earnings": round(float(self.df.loc[full_mask, 'Earnings (USD)'].sum()), 2),
+            "partial_ownership_earnings": round(float(self.df.loc[partial_mask, 'Earnings (USD)'].sum()), 2),
             "gross_revenue_generated": round(gross_total, 2),
             "your_total_earnings": round(your_total, 2),
-            "partner_share": round(partner_share, 2),
-            "effective_catalog_ownership_pct": round(effective_ownership, 1),
+            "partner_share": round(gross_total - your_total, 2),
+            "effective_catalog_ownership_pct": round((your_total / gross_total * 100) if gross_total > 0 else 100.0, 1),
         }
 
-    def get_deal_comparison(self) -> Dict[str, Any]:
-        """Per-song deal comparison with verdicts and auto-generated insights."""
-        if not self._has_team_pct:
-            return {"available": False, "reason": "No Team Percentage column in data"}
+    def get_release_strategy_analysis(self) -> Dict[str, Any]:
+        """Forward-looking release strategy: type performance, cross-release
+        cannibalization, platform affinity by type, and recommendations."""
+        if not self._has_upc:
+            return {"available": False, "reason": "No UPC/release data available"}
 
         sdf = self._streaming_df
+        result: Dict[str, Any] = {"available": True}
 
-        # Catalog baseline: solo songs only (100% ownership), streaming only
-        solo_streaming = sdf[sdf['team_percentage'] >= 100]
-        baseline_streams = solo_streaming.groupby('Title')['Quantity'].sum()
-        baseline_earnings = solo_streaming.groupby('Title')['Earnings (USD)'].sum()
-
-        catalog_avg_per_stream = 0.0
-        catalog_avg_streams = 0.0
-        if not baseline_streams.empty and baseline_streams.sum() > 0:
-            catalog_avg_per_stream = float(solo_streaming['Earnings (USD)'].sum() / solo_streaming['Quantity'].sum())
-            catalog_avg_streams = float(baseline_streams.mean())
-
-        baseline = {
-            "avg_per_stream": round(catalog_avg_per_stream, 4),
-            "avg_streams_per_song": round(catalog_avg_streams, 0),
-            "avg_earnings_per_song": round(float(baseline_earnings.mean()) if not baseline_earnings.empty else 0, 2),
-        }
-
-        # Build per-song entries, grouping by (Title, release_type/release_name, team_percentage)
-        has_release = self._has_upc and 'release_type' in self.df.columns
-
-        group_cols = ['Title']
-        if has_release:
-            group_cols.extend(['release_type', 'release_name'])
-        group_cols.append('team_percentage')
-
-        song_agg = self.df.groupby(group_cols).agg({
-            'Earnings (USD)': 'sum',
-            'gross_earnings': 'sum',
-            'Quantity': 'sum',
-        }).reset_index()
-
-        # Streaming per_stream for each entry
-        str_group = sdf.groupby(group_cols).agg({
-            'Earnings (USD)': 'sum',
-            'Quantity': 'sum',
-        }).reset_index()
-        str_group = str_group.rename(columns={'Earnings (USD)': 'str_earnings', 'Quantity': 'str_streams'})
-
-        song_agg = song_agg.merge(str_group, on=group_cols, how='left')
-        song_agg['str_earnings'] = song_agg['str_earnings'].fillna(0)
-        song_agg['str_streams'] = song_agg['str_streams'].fillna(0)
-
-        # Build comparison list grouped by song title
-        comparisons = []
-        for title, group in song_agg.groupby('Title'):
-            entries = []
-            for _, row in group.iterrows():
-                str_streams = int(row['str_streams'])
-                str_earnings = float(row['str_earnings'])
-                your_per_stream = round(str_earnings / str_streams, 4) if str_streams > 0 else 0
-                gross_per_stream = round(float(row['gross_earnings']) / int(row['Quantity']), 4) if row['Quantity'] > 0 else 0
-
-                entry = {
-                    "team_percentage": int(row['team_percentage']),
-                    "your_earnings": round(float(row['Earnings (USD)']), 2),
-                    "gross_earnings": round(float(row['gross_earnings']), 2),
-                    "streams": int(row['Quantity']),
-                    "your_per_stream": your_per_stream,
-                    "gross_per_stream": gross_per_stream,
-                }
-                if has_release:
-                    entry["release_type"] = row['release_type']
-                    entry["release_name"] = row['release_name']
-                entries.append(entry)
-
-            total_your = sum(e['your_earnings'] for e in entries)
-            total_gross = sum(e['gross_earnings'] for e in entries)
-            total_streams = sum(e['streams'] for e in entries)
-
-            # Determine the effective team_percentage (weighted by earnings)
-            if total_gross > 0:
-                weighted_pct = sum(e['team_percentage'] * e['gross_earnings'] for e in entries) / total_gross
-            else:
-                weighted_pct = 100.0
-            dominant_pct = round(weighted_pct)
-
-            verdict, verdict_reason = self._calculate_verdict(
-                team_pct=dominant_pct,
-                your_earnings=total_your,
-                total_streams=total_streams,
-                catalog_avg_per_stream=catalog_avg_per_stream,
-                catalog_avg_streams=catalog_avg_streams,
-            )
-
-            insights = self._generate_insights(
-                entries=entries,
-                total_your=total_your,
-                total_gross=total_gross,
-                total_streams=total_streams,
-                dominant_pct=dominant_pct,
-                catalog_avg_per_stream=catalog_avg_per_stream,
-                catalog_avg_streams=catalog_avg_streams,
-            )
-
-            comparisons.append({
-                "song": title,
-                "entries": entries,
-                "total_your_earnings": round(total_your, 2),
-                "total_gross_earnings": round(total_gross, 2),
-                "verdict": verdict,
-                "verdict_reason": verdict_reason,
-                "insights": insights,
-            })
-
-        # Sort: partial ownership first (most interesting), then by earnings desc
-        comparisons.sort(key=lambda x: (
-            0 if x['verdict'] != 'baseline' else 1,
-            -x['total_your_earnings'],
-        ))
-
-        return {
-            "available": True,
-            "catalog_baseline": baseline,
-            "songs": comparisons,
-        }
-
-    def get_deal_insights_summary(self) -> Dict[str, Any]:
-        """Summary: best collab, worst deal, overall recommendation."""
-        if not self._has_team_pct:
-            return {"available": False, "reason": "No Team Percentage column in data"}
-
-        deal_data = self.get_deal_comparison()
-        if not deal_data.get("available"):
-            return deal_data
-
-        songs = deal_data['songs']
-        partial_songs = [s for s in songs if s['verdict'] not in ('baseline', 'insufficient_data')]
-
-        if not partial_songs:
-            return {
-                "available": True,
-                "best_collab": None,
-                "worst_deal": None,
-                "recommendation": "Your entire catalog is 100% owned. No split deals to analyze.",
+        # ---------------------------------------------------------------
+        # 1. release_type_performance
+        # ---------------------------------------------------------------
+        total_earnings = float(sdf['Earnings (USD)'].sum())
+        type_perf = {}
+        for rtype in ['Single', 'EP', 'Album']:
+            rt_data = sdf[sdf['release_type'] == rtype]
+            if rt_data.empty:
+                continue
+            streams = int(rt_data['Quantity'].sum())
+            earnings = float(rt_data['Earnings (USD)'].sum())
+            per_stream = round(earnings / streams, 4) if streams > 0 else 0
+            pct = round(earnings / total_earnings * 100, 1) if total_earnings > 0 else 0
+            type_perf[rtype.lower() + 's'] = {
+                "count": int(rt_data['UPC'].nunique()),
+                "total_streams": streams,
+                "total_earnings": round(earnings, 2),
+                "per_stream": per_stream,
+                "pct_of_catalog_earnings": pct,
             }
 
-        # Best collab: prioritize verdict quality, then earnings
-        verdict_rank = {'worth_it': 3, 'marginal': 2, 'not_worth_it': 1}
-        best = max(partial_songs, key=lambda s: (verdict_rank.get(s['verdict'], 0), s['total_your_earnings']))
-        worst = min(partial_songs, key=lambda s: (verdict_rank.get(s['verdict'], 0), s['total_your_earnings']))
-
-        # Count verdicts
-        worth_it = sum(1 for s in partial_songs if s['verdict'] == 'worth_it')
-        not_worth = sum(1 for s in partial_songs if s['verdict'] == 'not_worth_it')
-        marginal = sum(1 for s in partial_songs if s['verdict'] == 'marginal')
-
-        # Avg earnings for split vs solo songs
-        split_avg = np.mean([s['total_your_earnings'] for s in partial_songs]) if partial_songs else 0
-        solo_songs = [s for s in songs if s['verdict'] == 'baseline']
-        solo_avg = np.mean([s['total_your_earnings'] for s in solo_songs]) if solo_songs else 0
-
-        if solo_avg > 0:
-            split_vs_solo_pct = round((split_avg / solo_avg - 1) * 100, 0)
-            if split_vs_solo_pct > 20:
-                direction = f"avg +{split_vs_solo_pct:.0f}% earnings"
-            elif split_vs_solo_pct < -20:
-                direction = f"avg {split_vs_solo_pct:.0f}% earnings"
+        # Generate comparison insight
+        rates = {k: v['per_stream'] for k, v in type_perf.items() if v['per_stream'] > 0}
+        if len(rates) >= 2:
+            best_type = max(rates, key=rates.get)
+            worst_type = min(rates, key=rates.get)
+            if rates[best_type] > 0 and rates[worst_type] > 0:
+                pct_diff = round((rates[best_type] / rates[worst_type] - 1) * 100, 0)
+                type_perf['insight'] = f"{best_type.title()} earn {pct_diff:.0f}% more per stream than {worst_type}"
             else:
-                direction = "roughly comparable earnings"
+                type_perf['insight'] = None
         else:
-            direction = "no solo baseline to compare"
+            type_perf['insight'] = None
 
-        recommendation = (
-            f"{worth_it} deal(s) worth it, {not_worth} not worth it, {marginal} marginal. "
-            f"Split songs have {direction} vs solo tracks."
+        result['release_type_performance'] = type_perf
+
+        # ---------------------------------------------------------------
+        # 2. cross_release_performance
+        # ---------------------------------------------------------------
+        # Find songs that appear on multiple release types (Single AND Album/EP)
+        has_release_type = 'release_type' in sdf.columns
+        cross_songs = []
+        avg_single_capture = []
+
+        if has_release_type:
+            song_types = sdf.groupby('Title')['release_type'].nunique()
+            multi_type_songs = song_types[song_types > 1].index
+
+            for title in multi_type_songs:
+                song_data = sdf[sdf['Title'] == title]
+                by_type = song_data.groupby('release_type').agg({
+                    'Quantity': 'sum',
+                    'Earnings (USD)': 'sum',
+                }).reset_index()
+
+                total_s = int(by_type['Quantity'].sum())
+                if total_s == 0:
+                    continue
+
+                single_row = by_type[by_type['release_type'] == 'Single']
+                album_row = by_type[by_type['release_type'].isin(['Album', 'EP'])]
+
+                single_streams = int(single_row['Quantity'].sum()) if not single_row.empty else 0
+                single_earnings = float(single_row['Earnings (USD)'].sum()) if not single_row.empty else 0
+                album_streams = int(album_row['Quantity'].sum()) if not album_row.empty else 0
+                album_earnings = float(album_row['Earnings (USD)'].sum()) if not album_row.empty else 0
+
+                single_capture = round(single_streams / total_s * 100, 0) if total_s > 0 else 0
+
+                entry: Dict[str, Any] = {
+                    "title": title,
+                    "single_streams": single_streams,
+                    "single_earnings": round(single_earnings, 2),
+                    "single_per_stream": round(single_earnings / single_streams, 4) if single_streams > 0 else 0,
+                    "album_streams": album_streams,
+                    "album_earnings": round(album_earnings, 2),
+                    "album_per_stream": round(album_earnings / album_streams, 4) if album_streams > 0 else 0,
+                    "single_capture_pct": single_capture,
+                }
+
+                if single_capture > 75:
+                    entry['insight'] = "Single version dominates"
+                elif single_capture > 50:
+                    entry['insight'] = "Single leads but album contributes"
+                elif single_capture > 0:
+                    entry['insight'] = "Album version outperforms single"
+                else:
+                    entry['insight'] = "Only on album/EP"
+
+                cross_songs.append(entry)
+                if single_streams > 0:
+                    avg_single_capture.append(single_capture)
+
+            cross_songs.sort(key=lambda x: x['single_earnings'] + x['album_earnings'], reverse=True)
+
+        avg_capture = round(float(np.mean(avg_single_capture)), 0) if avg_single_capture else 0
+        summary_text = (
+            f"Singles capture {avg_capture:.0f}% of streams when a song appears on both single and album"
+            if avg_single_capture
+            else "No cross-released songs found"
         )
 
-        # Partner share for worst deal
-        worst_partner_share = round(worst['total_gross_earnings'] - worst['total_your_earnings'], 2)
-
-        return {
-            "available": True,
-            "best_collab": {
-                "song": best['song'],
-                "your_earnings": best['total_your_earnings'],
-                "verdict": best['verdict'],
-                "why": best.get('verdict_reason') or (best['insights'][0] if best['insights'] else ''),
-            },
-            "worst_deal": {
-                "song": worst['song'],
-                "your_earnings": worst['total_your_earnings'],
-                "lost_to_split": worst_partner_share,
-                "verdict": worst['verdict'],
-                "why": worst.get('verdict_reason') or (worst['insights'][0] if worst['insights'] else ''),
-            },
-            "recommendation": recommendation,
+        result['cross_release_performance'] = {
+            "songs": cross_songs,
+            "average_single_capture_pct": avg_capture,
+            "summary": summary_text,
         }
 
-    # Minimum streams for a meaningful deal verdict
-    MIN_STREAMS_FOR_VERDICT = 100
+        # ---------------------------------------------------------------
+        # 3. platform_by_release_type
+        # ---------------------------------------------------------------
+        plat_by_type = []
+        if has_release_type:
+            for rtype in ['Single', 'EP', 'Album']:
+                rt_data = sdf[sdf['release_type'] == rtype]
+                if rt_data.empty:
+                    continue
+                plat_agg = rt_data.groupby('Store').agg({
+                    'Quantity': 'sum', 'Earnings (USD)': 'sum'
+                }).reset_index()
+                plat_agg = plat_agg[plat_agg['Quantity'] >= 1000]
+                if plat_agg.empty:
+                    continue
 
-    @staticmethod
-    def _calculate_verdict(
-        team_pct: int,
-        your_earnings: float,
-        total_streams: int,
-        catalog_avg_per_stream: float,
-        catalog_avg_streams: float,
-    ) -> tuple:
-        """Determine if a deal was worth it compared to solo baseline."""
-        if team_pct >= 100:
-            return "baseline", None
+                top_plat = plat_agg.sort_values('Earnings (USD)', ascending=False).iloc[0]
+                rt_total = rt_data['Earnings (USD)'].sum()
 
-        if total_streams < DistroKidAnalyzer.MIN_STREAMS_FOR_VERDICT:
-            return "insufficient_data", "Too few streams for a meaningful comparison"
+                plat_by_type.append({
+                    "release_type": rtype,
+                    "top_platform": top_plat['Store'],
+                    "per_stream": round(float(top_plat['Earnings (USD)'] / top_plat['Quantity']), 4) if top_plat['Quantity'] > 0 else 0,
+                    "pct_of_type_earnings": round(float(top_plat['Earnings (USD)'] / rt_total * 100), 1) if rt_total > 0 else 0,
+                })
 
-        # What would the artist earn solo with these streams at catalog avg rate?
-        hypothetical_solo = total_streams * catalog_avg_per_stream
+        result['platform_by_release_type'] = plat_by_type
 
-        if hypothetical_solo <= 0:
-            return "marginal", "Insufficient baseline data for comparison"
+        # ---------------------------------------------------------------
+        # 4. release_strategy_recommendations
+        # ---------------------------------------------------------------
+        recs = []
+        tp = result['release_type_performance']
+        crp = result['cross_release_performance']
 
-        ratio = your_earnings / hypothetical_solo
-        if ratio > 1.2:
-            pct_more = round((ratio - 1) * 100, 0)
-            return "worth_it", f"Earned {pct_more:.0f}% more than solo estimate despite {100 - team_pct}% split"
-        elif ratio > 0.8:
-            return "marginal", "Earned about the same as you would solo"
-        else:
-            lost = round(hypothetical_solo - your_earnings, 2)
-            return "not_worth_it", f"Lost ~${lost:,.0f} compared to solo ownership"
+        # Recommendation: release singles first
+        if avg_capture > 70:
+            recs.append({
+                "priority": "high",
+                "recommendation": "Release singles first",
+                "reason": f"Singles capture {avg_capture:.0f}% of total streams when a song is on both",
+                "impact": "Maximize early revenue before album release",
+            })
 
-    @staticmethod
-    def _generate_insights(
-        entries: List[Dict],
-        total_your: float,
-        total_gross: float,
-        total_streams: int,
-        dominant_pct: int,
-        catalog_avg_per_stream: float,
-        catalog_avg_streams: float,
-    ) -> List[str]:
-        """Auto-generate contextual insight notes for a song."""
-        insights = []
+        # Recommendation: singles earn more per stream
+        singles_rate = tp.get('singles', {}).get('per_stream', 0)
+        albums_rate = tp.get('albums', {}).get('per_stream', 0)
+        eps_rate = tp.get('eps', {}).get('per_stream', 0)
 
-        # Single vs Album insight
-        release_types = [e.get('release_type') for e in entries if e.get('release_type')]
-        if len(entries) > 1 and release_types:
-            single_entry = next((e for e in entries if e.get('release_type') == 'Single'), None)
-            non_single = [e for e in entries if e.get('release_type') and e['release_type'] != 'Single']
+        if singles_rate > 0 and albums_rate > 0 and singles_rate > albums_rate:
+            pct_more = round((singles_rate / albums_rate - 1) * 100, 0)
+            recs.append({
+                "priority": "high",
+                "recommendation": "Focus campaigns on singles",
+                "reason": f"Singles earn ${singles_rate:.4f}/stream vs ${albums_rate:.4f} on albums (+{pct_more:.0f}%)",
+                "impact": "Better ROI on promotion spend",
+            })
 
-            if single_entry and non_single:
-                single_streams = single_entry['streams']
-                if total_streams > 0:
-                    single_pct = round(single_streams / total_streams * 100, 0)
-                    insights.append(f"Single version captures {single_pct:.0f}% of total streams")
+        # Recommendation: album role
+        album_data = tp.get('albums', {})
+        if album_data:
+            album_pct = album_data.get('pct_of_catalog_earnings', 0)
+            album_count = album_data.get('count', 0)
+            if album_pct > 0 and album_pct < 30 and album_count > 0:
+                recs.append({
+                    "priority": "medium",
+                    "recommendation": "Use albums for catalog depth, not primary revenue",
+                    "reason": f"Album tracks earn {album_pct}% of revenue",
+                    "impact": "Set realistic expectations for album performance",
+                })
+            elif album_pct >= 30:
+                recs.append({
+                    "priority": "medium",
+                    "recommendation": "Albums are a strong revenue driver — keep releasing them",
+                    "reason": f"Album tracks earn {album_pct}% of your catalog revenue",
+                    "impact": "Continue investing in full-length releases",
+                })
 
-                single_rev_pct = round(single_entry['your_earnings'] / total_your * 100, 0) if total_your > 0 else 0
-                if abs(single_rev_pct - single_pct) > 5:
-                    insights.append(f"Single drives {single_rev_pct:.0f}% of this song's revenue")
+        # Recommendation: EP performance
+        if eps_rate > 0 and singles_rate > 0:
+            if eps_rate > singles_rate * 0.95:
+                recs.append({
+                    "priority": "medium",
+                    "recommendation": "EPs perform nearly as well as singles per stream",
+                    "reason": f"EP rate ${eps_rate:.4f} vs single rate ${singles_rate:.4f}",
+                    "impact": "EPs can be a good middle ground for releasing multiple tracks",
+                })
+            elif eps_rate < singles_rate * 0.8:
+                ep_drop = round((1 - eps_rate / singles_rate) * 100, 0)
+                recs.append({
+                    "priority": "low",
+                    "recommendation": "Consider releasing EP tracks as singles instead",
+                    "reason": f"EP tracks earn {ep_drop:.0f}% less per stream than singles",
+                    "impact": "Individual singles may generate more revenue",
+                })
 
-        # Split impact
-        if dominant_pct < 100:
-            partner_share = total_gross - total_your
-            insights.append(f"Partner/label share: ${partner_share:,.0f}")
+        # Recommendation: platform focus by type
+        if plat_by_type:
+            for pbt in plat_by_type:
+                if pbt['pct_of_type_earnings'] > 40:
+                    recs.append({
+                        "priority": "low",
+                        "recommendation": f"Prioritize {pbt['top_platform']} for {pbt['release_type'].lower()} releases",
+                        "reason": f"{pbt['top_platform']} drives {pbt['pct_of_type_earnings']}% of {pbt['release_type'].lower()} earnings",
+                        "impact": f"Focus promotion spend on the highest-performing platform for this format",
+                    })
 
-            # Audience multiplier vs solo average
-            if catalog_avg_streams > 0 and total_streams > catalog_avg_streams * 1.5:
-                mult = total_streams / catalog_avg_streams
-                insights.append(f"Collab brought {mult:.1f}x more streams than your solo average")
-            elif catalog_avg_streams > 0 and total_streams < catalog_avg_streams * 0.5:
-                insights.append("This deal underperformed your solo average in stream volume")
+        result['release_strategy_recommendations'] = recs
 
-        # $/stream comparison (use gross to compare apples-to-apples)
-        if total_streams > 0 and catalog_avg_per_stream > 0:
-            gross_rate = total_gross / total_streams
-            if gross_rate > catalog_avg_per_stream * 1.1:
-                insights.append(f"Strong gross $/stream (${gross_rate:.4f} vs ${catalog_avg_per_stream:.4f} avg)")
-            elif gross_rate < catalog_avg_per_stream * 0.9:
-                insights.append(f"Below-average gross $/stream (${gross_rate:.4f} vs ${catalog_avg_per_stream:.4f}) — check platform/geo mix")
-
-        return insights
+        return result
 
     def get_full_analysis(self) -> Dict[str, Any]:
         """Get complete analysis - all metrics including granular breakdown"""
@@ -980,10 +919,9 @@ class DistroKidAnalyzer:
             "release_breakdown": self.get_release_breakdown(),
             "release_type_summary": self.get_release_type_summary(),
             "release_type_monthly_trend": self.get_release_type_monthly_trend(),
-            # Deal intelligence — ownership, splits & deal performance
+            # Ownership & release strategy
             "ownership_summary": self.get_ownership_summary(),
-            "deal_comparison": self.get_deal_comparison(),
-            "deal_insights_summary": self.get_deal_insights_summary(),
+            "release_strategy_analysis": self.get_release_strategy_analysis(),
         }
 
         # Deep insights (ML-driven) — graceful degradation if libs missing
