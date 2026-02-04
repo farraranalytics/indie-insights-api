@@ -18,5 +18,10 @@ python-multipart==0.0.6
 # Environment
 python-dotenv==1.0.0
 
+# ML / Statistical Analysis
+scipy>=1.12.0
+scikit-learn>=1.4.0
+statsmodels>=0.14.0
+
 # Type checking
 pydantic==2.5.3
