@@ -14,33 +14,74 @@ from datetime import datetime
 class DistroKidAnalyzer:
     """
     Analyzes DistroKid 'Excruciating Detail' exports.
-    
+
     Usage:
         df = pd.read_excel('distrokid_export.xlsx')
         analyzer = DistroKidAnalyzer(df)
         results = analyzer.get_full_analysis()
     """
-    
+
+    # Known download/purchase platforms (not streaming)
+    NON_STREAMING_PLATFORMS = {'iTunes', 'Amazon (Downloads)', 'iTunes Songs', 'Amazon Songs'}
+
+    # Threshold: platforms with avg $/unit above this are likely purchase platforms
+    PURCHASE_RATE_THRESHOLD = 0.50
+
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
         self._prepare_data()
+        self._build_streaming_split()
         self._has_upc = 'UPC' in self.df.columns
         if self._has_upc:
             self._build_release_classification()
+            # Rebuild streaming split since _build_release_classification merges new columns onto self.df
+            self._build_streaming_split()
     
     def _prepare_data(self):
         """Clean and prepare the dataframe"""
         # Convert Sale Month to datetime
         self.df['Sale Month'] = pd.to_datetime(self.df['Sale Month'])
-        
+
         # Ensure numeric columns
         self.df['Quantity'] = pd.to_numeric(self.df['Quantity'], errors='coerce').fillna(0)
         self.df['Earnings (USD)'] = pd.to_numeric(self.df['Earnings (USD)'], errors='coerce').fillna(0)
-        
+
         # Add derived columns
         self.df['Year'] = self.df['Sale Month'].dt.year
         self.df['Quarter'] = self.df['Sale Month'].dt.to_period('Q').astype(str)
+
+        # Team Percentage / ownership processing
+        if 'Team Percentage' in self.df.columns:
+            self.df['team_percentage'] = pd.to_numeric(self.df['Team Percentage'], errors='coerce').fillna(100.0)
+            self._has_team_pct = True
+        else:
+            self.df['team_percentage'] = 100.0
+            self._has_team_pct = False
+
+        # Replace 0% with 100% (invalid data)
+        self.df.loc[self.df['team_percentage'] <= 0, 'team_percentage'] = 100.0
+
+        # Gross earnings = what the song actually generated before splits
+        self.df['gross_earnings'] = self.df['Earnings (USD)'] / (self.df['team_percentage'] / 100.0)
     
+    def _build_streaming_split(self):
+        """Identify non-streaming platforms and build streaming/purchase DataFrames."""
+        # Start with known non-streaming platforms
+        self._non_streaming = set(self.NON_STREAMING_PLATFORMS)
+
+        # Dynamically detect additional purchase platforms by avg $/unit
+        platform_agg = self.df.groupby('Store').agg({'Earnings (USD)': 'sum', 'Quantity': 'sum'})
+        platform_rates = (platform_agg['Earnings (USD)'] / platform_agg['Quantity']).replace([np.inf, -np.inf], 0).fillna(0)
+        dynamic_purchases = set(platform_rates[platform_rates > self.PURCHASE_RATE_THRESHOLD].index)
+        self._non_streaming |= dynamic_purchases
+
+        # Only keep platforms that actually exist in the data
+        self._non_streaming &= set(self.df['Store'].unique())
+
+        # Build filtered DataFrames
+        self._streaming_df = self.df[~self.df['Store'].isin(self._non_streaming)]
+        self._purchase_df = self.df[self.df['Store'].isin(self._non_streaming)]
+
     # Platforms where album/EP-level purchases appear (not individual songs)
     PURCHASE_PLATFORMS = {'iTunes', 'Amazon (Downloads)', 'iTunes Songs'}
 
@@ -189,7 +230,16 @@ class DistroKidAnalyzer:
         summary['track_count'] = summary['track_count'].astype(int)
         summary['pct_of_earnings'] = (summary['earnings'] / total_earnings * 100).round(1) if total_earnings > 0 else 0
         summary['pct_of_streams'] = (summary['streams'] / total_streams * 100).round(1) if total_streams > 0 else 0
-        summary['per_stream'] = (summary['earnings'] / summary['streams']).round(4)
+
+        # Compute per_stream from streaming data only
+        streaming_by_type = self._streaming_df.groupby('release_type').agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum',
+        }).reset_index()
+        streaming_by_type.columns = ['release_type', 'str_streams', 'str_earnings']
+        streaming_by_type['per_stream'] = (streaming_by_type['str_earnings'] / streaming_by_type['str_streams']).round(4)
+
+        summary = summary.merge(streaming_by_type[['release_type', 'per_stream']], on='release_type', how='left')
         summary = summary.replace([np.inf, -np.inf], np.nan).fillna(0)
         summary = summary.sort_values('earnings', ascending=False)
 
@@ -224,14 +274,23 @@ class DistroKidAnalyzer:
         """Get high-level summary statistics"""
         total_earnings = float(self.df['Earnings (USD)'].sum())
         total_streams = int(self.df['Quantity'].sum())
-        
+
+        streaming_earnings = float(self._streaming_df['Earnings (USD)'].sum())
+        streaming_streams = int(self._streaming_df['Quantity'].sum())
+        download_earnings = float(self._purchase_df['Earnings (USD)'].sum())
+        download_units = int(self._purchase_df['Quantity'].sum())
+
         return {
             "total_earnings": round(total_earnings, 2),
             "total_streams": total_streams,
             "unique_songs": int(self.df['Title'].nunique()),
             "unique_platforms": int(self.df['Store'].nunique()),
             "unique_countries": int(self.df['Country of Sale'].nunique()),
-            "avg_per_stream": round(total_earnings / total_streams, 4) if total_streams > 0 else 0,
+            "avg_per_stream": round(streaming_earnings / streaming_streams, 4) if streaming_streams > 0 else 0,
+            "streaming_earnings": round(streaming_earnings, 2),
+            "download_earnings": round(download_earnings, 2),
+            "download_units": download_units,
+            "non_streaming_platforms": sorted(self._non_streaming),
             "date_range": {
                 "start": self.df['Sale Month'].min().strftime('%Y-%m'),
                 "end": self.df['Sale Month'].max().strftime('%Y-%m')
@@ -275,52 +334,76 @@ class DistroKidAnalyzer:
     def get_song_breakdown(self, limit: int = 20) -> List[Dict]:
         """Get earnings breakdown by song"""
         total_earnings = self.df['Earnings (USD)'].sum()
-        
+
         songs = self.df.groupby('Title').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
-        
         songs.columns = ['title', 'streams', 'earnings']
-        songs['per_stream'] = (songs['earnings'] / songs['streams']).round(4)
+
+        # Compute per_stream from streaming data only
+        streaming_songs = self._streaming_df.groupby('Title').agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum'
+        }).reset_index()
+        streaming_songs.columns = ['title', 'streaming_streams', 'streaming_earnings']
+        streaming_songs['per_stream'] = (streaming_songs['streaming_earnings'] / streaming_songs['streaming_streams']).round(4)
+
+        songs = songs.merge(streaming_songs[['title', 'per_stream']], on='title', how='left')
+        songs['per_stream'] = songs['per_stream'].fillna(0)
         songs['pct_of_total'] = (songs['earnings'] / total_earnings * 100).round(1)
         songs['earnings'] = songs['earnings'].round(2)
         songs = songs.sort_values('earnings', ascending=False)
-        
+
         return songs.head(limit).to_dict('records')
     
     def get_platform_breakdown(self, limit: int = 15) -> List[Dict]:
         """Get earnings breakdown by platform/store"""
         total_earnings = self.df['Earnings (USD)'].sum()
-        
+
         platforms = self.df.groupby('Store').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
-        
+
         platforms.columns = ['platform', 'streams', 'earnings']
-        platforms['per_stream'] = (platforms['earnings'] / platforms['streams']).round(4)
+        platforms['is_streaming'] = ~platforms['platform'].isin(self._non_streaming)
+        streaming_mask = platforms['is_streaming']
+        platforms['per_stream'] = None
+        if streaming_mask.any():
+            platforms.loc[streaming_mask, 'per_stream'] = (
+                platforms.loc[streaming_mask, 'earnings'] / platforms.loc[streaming_mask, 'streams']
+            ).round(4)
         platforms['pct_of_total'] = (platforms['earnings'] / total_earnings * 100).round(1)
         platforms['earnings'] = platforms['earnings'].round(2)
         platforms = platforms.sort_values('earnings', ascending=False)
-        
+
         return platforms.head(limit).to_dict('records')
     
     def get_country_breakdown(self, limit: int = 20) -> List[Dict]:
         """Get earnings breakdown by country"""
         total_earnings = self.df['Earnings (USD)'].sum()
-        
+
         countries = self.df.groupby('Country of Sale').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
-        
         countries.columns = ['country', 'streams', 'earnings']
-        countries['per_stream'] = (countries['earnings'] / countries['streams']).round(4)
+
+        # Compute per_stream from streaming data only
+        streaming_countries = self._streaming_df.groupby('Country of Sale').agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum'
+        }).reset_index()
+        streaming_countries.columns = ['country', 'streaming_streams', 'streaming_earnings']
+        streaming_countries['per_stream'] = (streaming_countries['streaming_earnings'] / streaming_countries['streaming_streams']).round(4)
+
+        countries = countries.merge(streaming_countries[['country', 'per_stream']], on='country', how='left')
+        countries['per_stream'] = countries['per_stream'].fillna(0)
         countries['pct_of_total'] = (countries['earnings'] / total_earnings * 100).round(1)
         countries['earnings'] = countries['earnings'].round(2)
         countries = countries.sort_values('earnings', ascending=False)
-        
+
         return countries.head(limit).to_dict('records')
     
     def get_concentration_metrics(self) -> Dict[str, Any]:
@@ -402,7 +485,7 @@ class DistroKidAnalyzer:
     def get_platform_song_matrix(self, top_songs: int = 5) -> List[Dict]:
         """Get platform breakdown for top songs"""
         top_song_titles = self.df.groupby('Title')['Earnings (USD)'].sum().sort_values(ascending=False).head(top_songs).index
-        
+
         results = []
         for song in top_song_titles:
             song_df = self.df[self.df['Title'] == song]
@@ -410,39 +493,44 @@ class DistroKidAnalyzer:
                 'Quantity': 'sum',
                 'Earnings (USD)': 'sum'
             })
-            platforms['per_stream'] = platforms['Earnings (USD)'] / platforms['Quantity']
+            is_streaming = ~platforms.index.isin(self._non_streaming)
+            platforms['per_stream'] = np.where(
+                is_streaming,
+                (platforms['Earnings (USD)'] / platforms['Quantity']).round(4),
+                np.nan
+            )
             platforms['pct'] = platforms['Earnings (USD)'] / platforms['Earnings (USD)'].sum() * 100
             platforms = platforms.sort_values('Earnings (USD)', ascending=False)
-            
+
             results.append({
                 "song": song,
                 "platforms": [
                     {
                         "platform": platform,
                         "earnings": round(row['Earnings (USD)'], 2),
-                        "per_stream": round(row['per_stream'], 4),
+                        "per_stream": round(row['per_stream'], 4) if not pd.isna(row['per_stream']) else None,
                         "pct": round(row['pct'], 1)
                     }
                     for platform, row in platforms.head(5).iterrows()
                 ]
             })
-        
+
         return results
     
     def get_high_value_markets(self) -> Dict[str, List[Dict]]:
-        """Identify high-value vs high-volume markets"""
-        countries = self.df.groupby('Country of Sale').agg({
+        """Identify high-value vs high-volume markets (streaming only)"""
+        countries = self._streaming_df.groupby('Country of Sale').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         })
         countries['per_stream'] = countries['Earnings (USD)'] / countries['Quantity']
-        
+
         # High value = high $/stream, decent volume
         high_value = countries[countries['Quantity'] > 10000].sort_values('per_stream', ascending=False).head(5)
-        
+
         # High volume, low value
         high_volume_low_value = countries[countries['Quantity'] > 100000].sort_values('per_stream', ascending=True).head(5)
-        
+
         return {
             "high_value": [
                 {
@@ -467,22 +555,33 @@ class DistroKidAnalyzer:
     def get_catalog_excluding_top_song(self) -> Dict[str, Any]:
         """Analyze catalog performance excluding the #1 song"""
         top_song = self.df.groupby('Title')['Earnings (USD)'].sum().idxmax()
-        
+
         # Check for variants (e.g., "The Unknowing", "The Unknowing (Slowed)")
         base_name = top_song.split('(')[0].strip()
         df_filtered = self.df[~self.df['Title'].str.contains(base_name, case=False, na=False)]
-        
+        streaming_filtered = self._streaming_df[~self._streaming_df['Title'].str.contains(base_name, case=False, na=False)]
+
         total_filtered = df_filtered['Earnings (USD)'].sum()
-        
+
         songs = df_filtered.groupby('Title').agg({
             'Quantity': 'sum',
             'Earnings (USD)': 'sum'
         }).reset_index()
         songs.columns = ['title', 'streams', 'earnings']
-        songs['per_stream'] = (songs['earnings'] / songs['streams']).round(4)
+
+        # per_stream from streaming data only
+        streaming_songs = streaming_filtered.groupby('Title').agg({
+            'Quantity': 'sum',
+            'Earnings (USD)': 'sum'
+        }).reset_index()
+        streaming_songs.columns = ['title', 'str_streams', 'str_earnings']
+        streaming_songs['per_stream'] = (streaming_songs['str_earnings'] / streaming_songs['str_streams']).round(4)
+
+        songs = songs.merge(streaming_songs[['title', 'per_stream']], on='title', how='left')
+        songs['per_stream'] = songs['per_stream'].fillna(0)
         songs['earnings'] = songs['earnings'].round(2)
         songs = songs.sort_values('earnings', ascending=False)
-        
+
         return {
             "excluded_song": top_song,
             "excluded_pattern": base_name,
@@ -493,52 +592,377 @@ class DistroKidAnalyzer:
     def get_monthly_breakdown(self) -> List[Dict]:
         """
         Get GRANULAR monthly breakdown by song, platform, and country.
-        
+
         This is the source-of-truth data that enables accurate client-side filtering.
         Each row represents a unique (month, song, platform, country) combination.
-        
+
         Returns a list of dicts with:
             - month: YYYY-MM format
             - song: Song title
             - platform: Store/platform name
             - country: Country code
             - earnings: Total earnings for this combination
+            - gross_earnings: Earnings before splits
+            - team_percentage: Artist's ownership percentage
             - streams: Total streams for this combination
         """
         # Create a month string column for grouping (YYYY-MM format)
         df_copy = self.df.copy()
         df_copy['month_str'] = df_copy['Sale Month'].dt.strftime('%Y-%m')
-        
-        # Group by all dimensions (include release fields if available)
+
+        # Group by all dimensions (include release fields and team_percentage if available)
         group_cols = ['month_str', 'Title', 'Store', 'Country of Sale']
         if self._has_upc:
             group_cols.extend(['release_type', 'release_name'])
+        # team_percentage is per-song so it's safe to group by
+        group_cols.append('team_percentage')
 
-        breakdown = df_copy.groupby(group_cols).agg({
+        agg_dict = {
             'Quantity': 'sum',
-            'Earnings (USD)': 'sum'
-        }).reset_index()
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+        }
 
-        # Rename columns for clarity
+        breakdown = df_copy.groupby(group_cols).agg(agg_dict).reset_index()
+
+        # Build column names dynamically
+        base_cols = ['month', 'song', 'platform', 'country']
         if self._has_upc:
-            breakdown.columns = ['month', 'song', 'platform', 'country', 'release_type', 'release_name', 'streams', 'earnings']
-        else:
-            breakdown.columns = ['month', 'song', 'platform', 'country', 'streams', 'earnings']
-        
+            base_cols.extend(['release_type', 'release_name'])
+        base_cols.extend(['team_percentage', 'streams', 'earnings', 'gross_earnings'])
+        breakdown.columns = base_cols
+
         # Round earnings to 2 decimal places
         breakdown['earnings'] = breakdown['earnings'].round(2)
-        
+        breakdown['gross_earnings'] = breakdown['gross_earnings'].round(2)
+
         # Convert streams to int
         breakdown['streams'] = breakdown['streams'].astype(int)
-        
+
         # Sort by month, then earnings descending
         breakdown = breakdown.sort_values(['month', 'earnings'], ascending=[True, False])
-        
+
         return breakdown.to_dict('records')
     
+    # ------------------------------------------------------------------
+    # Deal Intelligence — ownership, splits & deal performance
+    # ------------------------------------------------------------------
+
+    def get_ownership_summary(self) -> Dict[str, Any]:
+        """High-level ownership breakdown: full vs partial, gross vs net."""
+        if not self._has_team_pct:
+            return {"available": False, "reason": "No Team Percentage column in data"}
+
+        full_mask = self.df['team_percentage'] >= 100
+        partial_mask = ~full_mask
+
+        full_songs = int(self.df.loc[full_mask, 'Title'].nunique())
+        partial_songs = int(self.df.loc[partial_mask, 'Title'].nunique())
+
+        your_total = float(self.df['Earnings (USD)'].sum())
+        gross_total = float(self.df['gross_earnings'].sum())
+        partner_share = gross_total - your_total
+
+        full_earnings = float(self.df.loc[full_mask, 'Earnings (USD)'].sum())
+        partial_earnings = float(self.df.loc[partial_mask, 'Earnings (USD)'].sum())
+
+        effective_ownership = (your_total / gross_total * 100) if gross_total > 0 else 100.0
+
+        return {
+            "available": True,
+            "full_ownership_songs": full_songs,
+            "partial_ownership_songs": partial_songs,
+            "full_ownership_earnings": round(full_earnings, 2),
+            "partial_ownership_earnings": round(partial_earnings, 2),
+            "gross_revenue_generated": round(gross_total, 2),
+            "your_total_earnings": round(your_total, 2),
+            "partner_share": round(partner_share, 2),
+            "effective_catalog_ownership_pct": round(effective_ownership, 1),
+        }
+
+    def get_deal_comparison(self) -> Dict[str, Any]:
+        """Per-song deal comparison with verdicts and auto-generated insights."""
+        if not self._has_team_pct:
+            return {"available": False, "reason": "No Team Percentage column in data"}
+
+        sdf = self._streaming_df
+
+        # Catalog baseline: solo songs only (100% ownership), streaming only
+        solo_streaming = sdf[sdf['team_percentage'] >= 100]
+        baseline_streams = solo_streaming.groupby('Title')['Quantity'].sum()
+        baseline_earnings = solo_streaming.groupby('Title')['Earnings (USD)'].sum()
+
+        catalog_avg_per_stream = 0.0
+        catalog_avg_streams = 0.0
+        if not baseline_streams.empty and baseline_streams.sum() > 0:
+            catalog_avg_per_stream = float(solo_streaming['Earnings (USD)'].sum() / solo_streaming['Quantity'].sum())
+            catalog_avg_streams = float(baseline_streams.mean())
+
+        baseline = {
+            "avg_per_stream": round(catalog_avg_per_stream, 4),
+            "avg_streams_per_song": round(catalog_avg_streams, 0),
+            "avg_earnings_per_song": round(float(baseline_earnings.mean()) if not baseline_earnings.empty else 0, 2),
+        }
+
+        # Build per-song entries, grouping by (Title, release_type/release_name, team_percentage)
+        has_release = self._has_upc and 'release_type' in self.df.columns
+
+        group_cols = ['Title']
+        if has_release:
+            group_cols.extend(['release_type', 'release_name'])
+        group_cols.append('team_percentage')
+
+        song_agg = self.df.groupby(group_cols).agg({
+            'Earnings (USD)': 'sum',
+            'gross_earnings': 'sum',
+            'Quantity': 'sum',
+        }).reset_index()
+
+        # Streaming per_stream for each entry
+        str_group = sdf.groupby(group_cols).agg({
+            'Earnings (USD)': 'sum',
+            'Quantity': 'sum',
+        }).reset_index()
+        str_group = str_group.rename(columns={'Earnings (USD)': 'str_earnings', 'Quantity': 'str_streams'})
+
+        song_agg = song_agg.merge(str_group, on=group_cols, how='left')
+        song_agg['str_earnings'] = song_agg['str_earnings'].fillna(0)
+        song_agg['str_streams'] = song_agg['str_streams'].fillna(0)
+
+        # Build comparison list grouped by song title
+        comparisons = []
+        for title, group in song_agg.groupby('Title'):
+            entries = []
+            for _, row in group.iterrows():
+                str_streams = int(row['str_streams'])
+                str_earnings = float(row['str_earnings'])
+                your_per_stream = round(str_earnings / str_streams, 4) if str_streams > 0 else 0
+                gross_per_stream = round(float(row['gross_earnings']) / int(row['Quantity']), 4) if row['Quantity'] > 0 else 0
+
+                entry = {
+                    "team_percentage": int(row['team_percentage']),
+                    "your_earnings": round(float(row['Earnings (USD)']), 2),
+                    "gross_earnings": round(float(row['gross_earnings']), 2),
+                    "streams": int(row['Quantity']),
+                    "your_per_stream": your_per_stream,
+                    "gross_per_stream": gross_per_stream,
+                }
+                if has_release:
+                    entry["release_type"] = row['release_type']
+                    entry["release_name"] = row['release_name']
+                entries.append(entry)
+
+            total_your = sum(e['your_earnings'] for e in entries)
+            total_gross = sum(e['gross_earnings'] for e in entries)
+            total_streams = sum(e['streams'] for e in entries)
+
+            # Determine the effective team_percentage (weighted by earnings)
+            if total_gross > 0:
+                weighted_pct = sum(e['team_percentage'] * e['gross_earnings'] for e in entries) / total_gross
+            else:
+                weighted_pct = 100.0
+            dominant_pct = round(weighted_pct)
+
+            verdict, verdict_reason = self._calculate_verdict(
+                team_pct=dominant_pct,
+                your_earnings=total_your,
+                total_streams=total_streams,
+                catalog_avg_per_stream=catalog_avg_per_stream,
+                catalog_avg_streams=catalog_avg_streams,
+            )
+
+            insights = self._generate_insights(
+                entries=entries,
+                total_your=total_your,
+                total_gross=total_gross,
+                total_streams=total_streams,
+                dominant_pct=dominant_pct,
+                catalog_avg_per_stream=catalog_avg_per_stream,
+                catalog_avg_streams=catalog_avg_streams,
+            )
+
+            comparisons.append({
+                "song": title,
+                "entries": entries,
+                "total_your_earnings": round(total_your, 2),
+                "total_gross_earnings": round(total_gross, 2),
+                "verdict": verdict,
+                "verdict_reason": verdict_reason,
+                "insights": insights,
+            })
+
+        # Sort: partial ownership first (most interesting), then by earnings desc
+        comparisons.sort(key=lambda x: (
+            0 if x['verdict'] != 'baseline' else 1,
+            -x['total_your_earnings'],
+        ))
+
+        return {
+            "available": True,
+            "catalog_baseline": baseline,
+            "songs": comparisons,
+        }
+
+    def get_deal_insights_summary(self) -> Dict[str, Any]:
+        """Summary: best collab, worst deal, overall recommendation."""
+        if not self._has_team_pct:
+            return {"available": False, "reason": "No Team Percentage column in data"}
+
+        deal_data = self.get_deal_comparison()
+        if not deal_data.get("available"):
+            return deal_data
+
+        songs = deal_data['songs']
+        partial_songs = [s for s in songs if s['verdict'] not in ('baseline', 'insufficient_data')]
+
+        if not partial_songs:
+            return {
+                "available": True,
+                "best_collab": None,
+                "worst_deal": None,
+                "recommendation": "Your entire catalog is 100% owned. No split deals to analyze.",
+            }
+
+        # Best collab: prioritize verdict quality, then earnings
+        verdict_rank = {'worth_it': 3, 'marginal': 2, 'not_worth_it': 1}
+        best = max(partial_songs, key=lambda s: (verdict_rank.get(s['verdict'], 0), s['total_your_earnings']))
+        worst = min(partial_songs, key=lambda s: (verdict_rank.get(s['verdict'], 0), s['total_your_earnings']))
+
+        # Count verdicts
+        worth_it = sum(1 for s in partial_songs if s['verdict'] == 'worth_it')
+        not_worth = sum(1 for s in partial_songs if s['verdict'] == 'not_worth_it')
+        marginal = sum(1 for s in partial_songs if s['verdict'] == 'marginal')
+
+        # Avg earnings for split vs solo songs
+        split_avg = np.mean([s['total_your_earnings'] for s in partial_songs]) if partial_songs else 0
+        solo_songs = [s for s in songs if s['verdict'] == 'baseline']
+        solo_avg = np.mean([s['total_your_earnings'] for s in solo_songs]) if solo_songs else 0
+
+        if solo_avg > 0:
+            split_vs_solo_pct = round((split_avg / solo_avg - 1) * 100, 0)
+            if split_vs_solo_pct > 20:
+                direction = f"avg +{split_vs_solo_pct:.0f}% earnings"
+            elif split_vs_solo_pct < -20:
+                direction = f"avg {split_vs_solo_pct:.0f}% earnings"
+            else:
+                direction = "roughly comparable earnings"
+        else:
+            direction = "no solo baseline to compare"
+
+        recommendation = (
+            f"{worth_it} deal(s) worth it, {not_worth} not worth it, {marginal} marginal. "
+            f"Split songs have {direction} vs solo tracks."
+        )
+
+        # Partner share for worst deal
+        worst_partner_share = round(worst['total_gross_earnings'] - worst['total_your_earnings'], 2)
+
+        return {
+            "available": True,
+            "best_collab": {
+                "song": best['song'],
+                "your_earnings": best['total_your_earnings'],
+                "verdict": best['verdict'],
+                "why": best.get('verdict_reason') or (best['insights'][0] if best['insights'] else ''),
+            },
+            "worst_deal": {
+                "song": worst['song'],
+                "your_earnings": worst['total_your_earnings'],
+                "lost_to_split": worst_partner_share,
+                "verdict": worst['verdict'],
+                "why": worst.get('verdict_reason') or (worst['insights'][0] if worst['insights'] else ''),
+            },
+            "recommendation": recommendation,
+        }
+
+    # Minimum streams for a meaningful deal verdict
+    MIN_STREAMS_FOR_VERDICT = 100
+
+    @staticmethod
+    def _calculate_verdict(
+        team_pct: int,
+        your_earnings: float,
+        total_streams: int,
+        catalog_avg_per_stream: float,
+        catalog_avg_streams: float,
+    ) -> tuple:
+        """Determine if a deal was worth it compared to solo baseline."""
+        if team_pct >= 100:
+            return "baseline", None
+
+        if total_streams < DistroKidAnalyzer.MIN_STREAMS_FOR_VERDICT:
+            return "insufficient_data", "Too few streams for a meaningful comparison"
+
+        # What would the artist earn solo with these streams at catalog avg rate?
+        hypothetical_solo = total_streams * catalog_avg_per_stream
+
+        if hypothetical_solo <= 0:
+            return "marginal", "Insufficient baseline data for comparison"
+
+        ratio = your_earnings / hypothetical_solo
+        if ratio > 1.2:
+            pct_more = round((ratio - 1) * 100, 0)
+            return "worth_it", f"Earned {pct_more:.0f}% more than solo estimate despite {100 - team_pct}% split"
+        elif ratio > 0.8:
+            return "marginal", "Earned about the same as you would solo"
+        else:
+            lost = round(hypothetical_solo - your_earnings, 2)
+            return "not_worth_it", f"Lost ~${lost:,.0f} compared to solo ownership"
+
+    @staticmethod
+    def _generate_insights(
+        entries: List[Dict],
+        total_your: float,
+        total_gross: float,
+        total_streams: int,
+        dominant_pct: int,
+        catalog_avg_per_stream: float,
+        catalog_avg_streams: float,
+    ) -> List[str]:
+        """Auto-generate contextual insight notes for a song."""
+        insights = []
+
+        # Single vs Album insight
+        release_types = [e.get('release_type') for e in entries if e.get('release_type')]
+        if len(entries) > 1 and release_types:
+            single_entry = next((e for e in entries if e.get('release_type') == 'Single'), None)
+            non_single = [e for e in entries if e.get('release_type') and e['release_type'] != 'Single']
+
+            if single_entry and non_single:
+                single_streams = single_entry['streams']
+                if total_streams > 0:
+                    single_pct = round(single_streams / total_streams * 100, 0)
+                    insights.append(f"Single version captures {single_pct:.0f}% of total streams")
+
+                single_rev_pct = round(single_entry['your_earnings'] / total_your * 100, 0) if total_your > 0 else 0
+                if abs(single_rev_pct - single_pct) > 5:
+                    insights.append(f"Single drives {single_rev_pct:.0f}% of this song's revenue")
+
+        # Split impact
+        if dominant_pct < 100:
+            partner_share = total_gross - total_your
+            insights.append(f"Partner/label share: ${partner_share:,.0f}")
+
+            # Audience multiplier vs solo average
+            if catalog_avg_streams > 0 and total_streams > catalog_avg_streams * 1.5:
+                mult = total_streams / catalog_avg_streams
+                insights.append(f"Collab brought {mult:.1f}x more streams than your solo average")
+            elif catalog_avg_streams > 0 and total_streams < catalog_avg_streams * 0.5:
+                insights.append("This deal underperformed your solo average in stream volume")
+
+        # $/stream comparison (use gross to compare apples-to-apples)
+        if total_streams > 0 and catalog_avg_per_stream > 0:
+            gross_rate = total_gross / total_streams
+            if gross_rate > catalog_avg_per_stream * 1.1:
+                insights.append(f"Strong gross $/stream (${gross_rate:.4f} vs ${catalog_avg_per_stream:.4f} avg)")
+            elif gross_rate < catalog_avg_per_stream * 0.9:
+                insights.append(f"Below-average gross $/stream (${gross_rate:.4f} vs ${catalog_avg_per_stream:.4f}) — check platform/geo mix")
+
+        return insights
+
     def get_full_analysis(self) -> Dict[str, Any]:
         """Get complete analysis - all metrics including granular breakdown"""
-        return {
+        result = {
             "overview": self.get_overview(),
             "monthly_trend": self.get_monthly_trend(),
             "yearly_trend": self.get_yearly_trend(),
@@ -556,7 +980,25 @@ class DistroKidAnalyzer:
             "release_breakdown": self.get_release_breakdown(),
             "release_type_summary": self.get_release_type_summary(),
             "release_type_monthly_trend": self.get_release_type_monthly_trend(),
+            # Deal intelligence — ownership, splits & deal performance
+            "ownership_summary": self.get_ownership_summary(),
+            "deal_comparison": self.get_deal_comparison(),
+            "deal_insights_summary": self.get_deal_insights_summary(),
         }
+
+        # Deep insights (ML-driven) — graceful degradation if libs missing
+        try:
+            from .insights_engine import InsightsEngine
+            engine = InsightsEngine(self.df, self._streaming_df, self._non_streaming, self._has_upc)
+            result["deep_insights"] = engine.get_all_insights()
+        except ImportError:
+            result["deep_insights"] = {"available": False, "reason": "ML libraries not installed"}
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Deep insights failed: {e}", exc_info=True)
+            result["deep_insights"] = {"available": False, "error": str(e)}
+
+        return result
 
 
 # For testing
